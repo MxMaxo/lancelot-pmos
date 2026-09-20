@@ -1,0 +1,983 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * FocalTech FT8719 SPI touchscreen driver for Xiaomi Redmi 9 (lancelot).
+ *
+ * Ported to mainline from the downstream MediaTek FT8719P driver
+ * (android_kernel_xiaomi_mt6768, GPL-2.0, Copyright 2021 XiaoMi, Inc.),
+ * stripped of the MTK TPD framework, HID/proximity/gesture/ESD extras.
+ *
+ * The FT8719 is a "no flash" part: the touch firmware (focaltech_ts_fw_huaxing.bin)
+ * must be uploaded to its PRAM on every boot via the FocalTech ROM-boot protocol.
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/interrupt.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/gpio/consumer.h>
+#include <linux/input.h>
+#include <linux/input/mt.h>
+#include <linux/input/touchscreen.h>
+#include <linux/firmware.h>
+#include <linux/spi/spi.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
+
+#define FTS_DRIVER_NAME		"fts_ts"
+#define FTS_MAX_POINTS		10
+#define FTS_ONE_TCH_LEN		6
+#define FTS_TOUCH_DATA_LEN	(FTS_MAX_POINTS * FTS_ONE_TCH_LEN + 3)
+
+#define FTS_TOUCH_POINT_NUM	2
+#define FTS_TOUCH_X_H_POS	3
+#define FTS_TOUCH_X_L_POS	4
+#define FTS_TOUCH_Y_H_POS	5
+#define FTS_TOUCH_Y_L_POS	6
+#define FTS_TOUCH_PRE_POS	7
+#define FTS_TOUCH_AREA_POS	8
+#define FTS_TOUCH_EVENT_POS	3
+#define FTS_TOUCH_ID_POS	5
+#define FTS_MAX_ID		0x0A
+
+#define FTS_TOUCH_DOWN		0
+#define FTS_TOUCH_UP		1
+#define FTS_TOUCH_CONTACT	2
+#define EVENT_DOWN(f)		((f) == FTS_TOUCH_DOWN || (f) == FTS_TOUCH_CONTACT)
+
+/* boot / id commands */
+#define FTS_CMD_START1		0x55
+#define FTS_CMD_START2		0xAA
+#define FTS_CMD_START_DELAY	12
+#define FTS_CMD_READ_ID		0x90
+
+#define FTS_REG_CHIP_ID		0xA3
+#define FTS_REG_FW_VER		0xA6
+
+/* SPI protocol packages */
+#define STATUS_PACKAGE		0x05
+#define COMMAND_PACKAGE		0xC0
+#define DATA_PACKAGE		0x3F
+#define DATA_CRC_EN		0x20
+#define WRITE_CMD		0x00
+#define READ_CMD		(0x80 | DATA_CRC_EN)
+#define CD_PACKAGE_BUFLEN	4
+#define SPI_BUF_LENGTH		256
+#define MTK_SPI_PACKET_SIZE	1024
+
+/* romboot / upgrade commands */
+#define FTS_ROMBOOT_CMD_WRITE		0xAE
+#define FTS_ROMBOOT_CMD_START_APP	0x08
+#define FTS_ROMBOOT_CMD_ECC		0xCC
+#define FTS_ROMBOOT_CMD_ECC_READ	0xCD
+#define FTS_ROMBOOT_CMD_ECC_FINISH	0xCE
+#define FTS_ROMBOOT_CMD_ECC_NEW_LEN	7
+#define FTS_CMD_WRITE_LEN		6
+
+#define FTS_APP_INFO_OFFSET		0x100
+#define FTS_FLASH_PACKET_LENGTH_SPI	(32 * 1024 - 16)
+#define FTS_FLASH_PACKET_LENGTH_SPI_LOW	(4 * 1024 - 4)
+#define FTS_MIN_LEN			0x120
+#define FTS_ECC_FINISH_TIMEOUT		100
+#define AL2_FCS_COEF			((1 << 15) + (1 << 10) + (1 << 3))
+
+#define FTS_READ_BOOT_ID_TIMEOUT	3
+#define FTS_UPGRADE_LOOP		3
+
+#define FW_NAME				"focaltech_ts_fw_huaxing.bin"
+
+/* FT8719 upgrade settings: rom_id 0x87 0x19, app2 64K, ecclen 128K,
+ * eccok 0x00, upgsts 0x02, delay 8, spi_pe, no half_length, fd_check, no dram */
+#define FT8719_ROM_IDH		0x87
+#define FT8719_ROM_IDL		0x19
+#define FT8719_APP2_OFFSET	(64 * 1024)
+#define FT8719_ECCLEN_MAX	(128 * 1024)
+#define FT8719_ECC_OK		0x00
+#define FT8719_DELAY_INIT	8
+
+struct fts_ts_data {
+	struct spi_device *spi;
+	struct device *dev;
+	struct input_dev *input_dev;
+	struct gpio_desc *reset_gpio;
+	struct mutex bus_lock;
+	int irq;
+	int fw_is_running;
+	u8 *bus_tx_buf;
+	u8 *bus_rx_buf;
+	u8 *point_buf;
+	int pnt_buf_size;
+	struct touchscreen_properties prop;
+	struct work_struct fw_work;
+};
+
+/* single instance, like the downstream design */
+static struct fts_ts_data *fts_data;
+
+static int fts_spi_transfer(struct fts_ts_data *data, u8 *tx_buf, u8 *rx_buf, u32 len)
+{
+	struct spi_device *spi = data->spi;
+	struct spi_message msg;
+	struct spi_transfer xfer[3];
+	int packet_length = 0;
+	int packet_remainder = 0;
+	int data_len = 0;
+	int data_pos = 0;
+	int ret;
+
+	if (!spi || !tx_buf || !rx_buf || !len)
+		return -EINVAL;
+
+	memset(xfer, 0, sizeof(xfer));
+	spi_message_init(&msg);
+
+	/* first byte is the package type, needs a settling delay */
+	xfer[0].tx_buf = &tx_buf[0];
+	xfer[0].len = 1;
+	xfer[0].delay.value = 30;
+	xfer[0].delay.unit = SPI_DELAY_UNIT_USECS;
+	spi_message_add_tail(&xfer[0], &msg);
+
+	if (len > CD_PACKAGE_BUFLEN) {
+		data_len = len - CD_PACKAGE_BUFLEN;
+		data_pos = CD_PACKAGE_BUFLEN;
+		if (data_len > MTK_SPI_PACKET_SIZE)
+			packet_remainder = data_len % MTK_SPI_PACKET_SIZE;
+		packet_length = data_len - packet_remainder;
+		xfer[1].tx_buf = &tx_buf[data_pos];
+		xfer[1].rx_buf = &rx_buf[data_pos];
+		xfer[1].len = packet_length;
+		spi_message_add_tail(&xfer[1], &msg);
+
+		if (packet_remainder) {
+			data_pos += packet_length;
+			xfer[2].tx_buf = &tx_buf[data_pos];
+			xfer[2].rx_buf = &rx_buf[data_pos];
+			xfer[2].len = packet_remainder;
+			spi_message_add_tail(&xfer[2], &msg);
+		}
+	}
+
+	ret = spi_sync(spi, &msg);
+	if (ret)
+		return ret;
+
+	udelay(150);
+	return 0;
+}
+
+static void crckermit(u8 *d, u16 len, u16 *crc_out)
+{
+	u16 i, j, crc = 0xFFFF;
+
+	for (i = 0; i < len; i++) {
+		crc ^= d[i];
+		for (j = 0; j < 8; j++)
+			crc = (crc & 0x01) ? ((crc >> 1) ^ 0x8408) : (crc >> 1);
+	}
+	*crc_out = crc;
+}
+
+static int rdata_check(u8 *rdata, u32 rlen)
+{
+	u16 crc_calc = 0;
+	u16 crc_read;
+
+	crckermit(rdata, rlen - 2, &crc_calc);
+	crc_read = (u16)(rdata[rlen - 1] << 8) + rdata[rlen - 2];
+	if (crc_calc != crc_read)
+		return -EIO;
+	return 0;
+}
+
+static int fts_wait_idle(struct fts_ts_data *data)
+{
+	int ret, i;
+	int status = 0xFF;
+	int idle_status = 0x01;
+	int status_mask = 0x81;
+	u8 *txbuf = data->bus_tx_buf;
+	u8 *rxbuf = data->bus_rx_buf;
+
+	if (!data->fw_is_running)
+		idle_status = 0x00;
+
+	memset(txbuf, 0, SPI_BUF_LENGTH);
+	memset(rxbuf, 0, SPI_BUF_LENGTH);
+	txbuf[0] = STATUS_PACKAGE;
+
+	for (i = 0; i < 100; i++) {
+		udelay(150);
+		ret = fts_spi_transfer(data, txbuf, rxbuf, CD_PACKAGE_BUFLEN + 1);
+		if (ret >= 0) {
+			status = (int)rxbuf[CD_PACKAGE_BUFLEN];
+			if ((status & status_mask) == idle_status)
+				break;
+		}
+	}
+
+	if (i >= 100) {
+		dev_err(&data->spi->dev, "spi busy, status:0x%x\n", status);
+		return -EIO;
+	}
+	return (int)status;
+}
+
+static int fts_cmdpkg_write(struct fts_ts_data *data, u8 ctrl, u8 *cmd, u32 cmdlen)
+{
+	int i;
+	u8 *txbuf = data->bus_tx_buf;
+	u8 *rxbuf = data->bus_rx_buf;
+	u32 txlen;
+
+	if (!cmd || !cmdlen || cmdlen > (16 - 4))
+		return -EINVAL;
+
+	txbuf[0] = COMMAND_PACKAGE;
+	txlen = CD_PACKAGE_BUFLEN;
+	txbuf[txlen++] = ctrl | (cmdlen & 0x0F);
+	for (i = 0; i < cmdlen; i++)
+		txbuf[txlen++] = cmd[i];
+
+	return fts_spi_transfer(data, txbuf, rxbuf, txlen);
+}
+
+static int fts_write(struct fts_ts_data *data, u8 *writebuf, u32 writelen)
+{
+	u8 *cmd = writebuf;
+	u32 cmdlen;
+	u8 *dbuf = NULL;
+	u32 dlen = 0;
+	u8 tmpcmd[16] = { 0 };
+	u32 txlen;
+	u32 txlen_need;
+	u8 *txbuf, *rxbuf;
+	int ret;
+
+	if (!writebuf || !writelen)
+		return -EINVAL;
+
+	if (writelen == 1) {
+		cmdlen = 1;
+	} else {
+		cmdlen = 1;
+		if (!data->fw_is_running) {
+			if (cmd[0] == 0xAE || cmd[0] == 0x85 || cmd[0] == 0xF2)
+				cmdlen = 6;
+			else if (cmd[0] == 0xCC)
+				cmdlen = 7;
+		}
+		dbuf = writebuf + cmdlen;
+		dlen = writelen - cmdlen;
+	}
+
+	mutex_lock(&data->bus_lock);
+	ret = fts_wait_idle(data);
+	if (ret < 0)
+		goto out;
+
+	memcpy(tmpcmd, cmd, cmdlen);
+	if (data->fw_is_running && dbuf && dlen) {
+		tmpcmd[cmdlen++] = (dlen >> 8) & 0xFF;
+		tmpcmd[cmdlen++] = dlen & 0xFF;
+	}
+	ret = fts_cmdpkg_write(data, WRITE_CMD, tmpcmd, cmdlen);
+	if (ret < 0)
+		goto out;
+
+	if (dbuf && dlen) {
+		ret = fts_wait_idle(data);
+		if (ret < 0)
+			goto out;
+
+		txlen_need = CD_PACKAGE_BUFLEN + dlen;
+		txbuf = data->bus_tx_buf;
+		rxbuf = data->bus_rx_buf;
+		if (txlen_need > SPI_BUF_LENGTH) {
+			txbuf = kzalloc(txlen_need, GFP_KERNEL);
+			rxbuf = kzalloc(txlen_need, GFP_KERNEL);
+			if (!txbuf || !rxbuf) {
+				ret = -ENOMEM;
+				kfree(txbuf);
+				kfree(rxbuf);
+				goto out;
+			}
+		} else {
+			memset(txbuf, 0, SPI_BUF_LENGTH);
+			memset(rxbuf, 0, SPI_BUF_LENGTH);
+		}
+
+		txbuf[0] = DATA_PACKAGE;
+		txlen = CD_PACKAGE_BUFLEN + dlen;
+		memcpy(txbuf + CD_PACKAGE_BUFLEN, dbuf, dlen);
+		ret = fts_spi_transfer(data, txbuf, rxbuf, txlen);
+
+		if (txlen_need > SPI_BUF_LENGTH) {
+			kfree(txbuf);
+			kfree(rxbuf);
+		}
+	}
+out:
+	mutex_unlock(&data->bus_lock);
+	return ret;
+}
+
+static int fts_write_reg(struct fts_ts_data *data, u8 addr, u8 value)
+{
+	u8 buf[2] = { addr, value };
+	return fts_write(data, buf, 2);
+}
+
+static int fts_read(struct fts_ts_data *data, u8 *cmd, u32 cmdlen, u8 *rbuf, u32 datalen)
+{
+	int ret;
+	u8 ctrl = READ_CMD;
+	bool use_crc = (cmd && cmdlen);
+	u8 tmpcmd[16] = { 0 };
+	u32 txlen, txlen_need;
+	u8 *txbuf, *rxbuf;
+
+	mutex_lock(&data->bus_lock);
+	if (cmd && cmdlen) {
+		ret = fts_wait_idle(data);
+		if (ret < 0)
+			goto out;
+
+		memcpy(tmpcmd, cmd, cmdlen);
+		if (data->fw_is_running) {
+			tmpcmd[cmdlen++] = (datalen >> 8) & 0xFF;
+			tmpcmd[cmdlen++] = datalen & 0xFF;
+		}
+		ret = fts_cmdpkg_write(data, ctrl, tmpcmd, cmdlen);
+		if (ret < 0)
+			goto out;
+
+		ret = fts_wait_idle(data);
+		if (ret < 0)
+			goto out;
+	}
+
+	if (rbuf && datalen) {
+		txlen_need = CD_PACKAGE_BUFLEN + datalen;
+		txbuf = data->bus_tx_buf;
+		rxbuf = data->bus_rx_buf;
+		if (txlen_need > SPI_BUF_LENGTH) {
+			txbuf = kzalloc(txlen_need, GFP_KERNEL);
+			rxbuf = kzalloc(txlen_need, GFP_KERNEL);
+			if (!txbuf || !rxbuf) {
+				ret = -ENOMEM;
+				kfree(txbuf);
+				kfree(rxbuf);
+				goto out;
+			}
+		} else {
+			memset(txbuf, 0, SPI_BUF_LENGTH);
+			memset(rxbuf, 0, SPI_BUF_LENGTH);
+		}
+
+		txbuf[0] = DATA_PACKAGE;
+		txlen = CD_PACKAGE_BUFLEN + datalen;
+		if (use_crc)
+			txlen += 2;
+		ret = fts_spi_transfer(data, txbuf, rxbuf, txlen);
+		if (ret < 0)
+			goto free_out;
+
+		memcpy(rbuf, rxbuf + CD_PACKAGE_BUFLEN, datalen);
+		if (use_crc)
+			ret = rdata_check(rxbuf + CD_PACKAGE_BUFLEN, txlen - CD_PACKAGE_BUFLEN);
+free_out:
+		if (txlen_need > SPI_BUF_LENGTH) {
+			kfree(txbuf);
+			kfree(rxbuf);
+		}
+	}
+out:
+	mutex_unlock(&data->bus_lock);
+	return ret;
+}
+
+static int fts_read_reg(struct fts_ts_data *data, u8 addr, u8 *value)
+{
+	return fts_read(data, &addr, 1, value, 1);
+}
+
+static void fts_reset(struct fts_ts_data *data, int delay_ms)
+{
+	gpiod_set_value_cansleep(data->reset_gpio, 0);
+	msleep(1);
+	gpiod_set_value_cansleep(data->reset_gpio, 1);
+	if (delay_ms)
+		msleep(delay_ms);
+}
+
+static int fts_read_bootid(struct fts_ts_data *data, u8 *id)
+{
+	int ret;
+	u8 chip_id[2] = { 0 };
+	u8 id_cmd[4] = { 0 };
+
+	id_cmd[0] = FTS_CMD_START1;
+	id_cmd[1] = FTS_CMD_START2;
+	ret = fts_write(data, id_cmd, 2);
+	if (ret < 0)
+		return ret;
+
+	msleep(FTS_CMD_START_DELAY);
+	id_cmd[0] = FTS_CMD_READ_ID;
+	id_cmd[1] = id_cmd[2] = id_cmd[3] = 0x00;
+	ret = fts_read(data, id_cmd, 4, chip_id, 2);
+	if (ret < 0 || chip_id[0] == 0 || chip_id[1] == 0)
+		return -EIO;
+
+	id[0] = chip_id[0];
+	id[1] = chip_id[1];
+	return 0;
+}
+
+static int fts_get_ic_information(struct fts_ts_data *data)
+{
+	int ret, cnt;
+	u8 chip_id[2] = { 0 };
+
+	for (cnt = 0; cnt < 3; cnt++) {
+		fts_reset(data, FTS_CMD_START_DELAY);
+		ret = fts_read_bootid(data, chip_id);
+		if (ret < 0)
+			continue;
+
+		if (chip_id[0] == FT8719_ROM_IDH && chip_id[1] == FT8719_ROM_IDL)
+			break;
+	}
+
+	if (cnt >= 3) {
+		dev_err(&data->spi->dev, "get ic information fail\n");
+		return -EIO;
+	}
+
+	dev_info(&data->spi->dev, "chip id = 0x%02x%02x\n", chip_id[0], chip_id[1]);
+	return 0;
+}
+
+/* ---- firmware upgrade (PRAM boot) ---- */
+
+static int fts_check_bootid(struct fts_ts_data *data)
+{
+	u8 cmd = FTS_CMD_READ_ID;
+	u8 id[2] = { 0 };
+	int ret;
+
+	ret = fts_read(data, &cmd, 1, id, 2);
+	if (ret < 0)
+		return ret;
+
+	if (id[0] == FT8719_ROM_IDH && id[1] == FT8719_ROM_IDL)
+		return 0;
+	return -EIO;
+}
+
+static int fts_enter_into_boot(struct fts_ts_data *data)
+{
+	int i, j, ret;
+	u8 cmd;
+
+	for (i = 0; i < FTS_UPGRADE_LOOP; i++) {
+		fts_reset(data, 0);
+		mdelay(FT8719_DELAY_INIT);
+
+		for (j = 0; j < FTS_READ_BOOT_ID_TIMEOUT; j++) {
+			cmd = FTS_CMD_START1;
+			ret = fts_write(data, &cmd, 1);
+			if (ret >= 0) {
+				mdelay(FT8719_DELAY_INIT);
+				if (fts_check_bootid(data) == 0)
+					return 0;
+			}
+		}
+	}
+	return -EIO;
+}
+
+static bool fts_check_fast_download(struct fts_ts_data *data)
+{
+	u8 cmd[6] = { 0xF2, 0x00, 0x78, 0x0A, 0x00, 0x02 };
+	u8 value = 0;
+	u8 value2[2] = { 0 };
+	int ret;
+
+	ret = fts_read_reg(data, 0xdb, &value);
+	if (ret < 0)
+		return false;
+
+	ret = fts_read(data, cmd, 6, value2, 2);
+	if (ret < 0)
+		return false;
+
+	if (value >= 0x18 && value2[0] == 0x55)
+		return true;
+	return false;
+}
+
+static int fts_dpram_write_pe(struct fts_ts_data *data, u32 saddr,
+			      const u8 *buf, u32 len)
+{
+	int i, j, ret;
+	u32 addr, offset, remainder, packet_number, packet_len;
+	u32 packet_size = FTS_FLASH_PACKET_LENGTH_SPI;
+	bool fd_support = true;
+	u8 *cmd;
+
+	if (!buf || len < FTS_MIN_LEN || len > FT8719_APP2_OFFSET)
+		return -EINVAL;
+
+	fd_support = fts_check_fast_download(data);
+	if (!fd_support)
+		packet_size = FTS_FLASH_PACKET_LENGTH_SPI_LOW;
+
+	cmd = vmalloc(packet_size + FTS_CMD_WRITE_LEN + 1);
+	if (!cmd)
+		return -ENOMEM;
+	memset(cmd, 0, packet_size + FTS_CMD_WRITE_LEN + 1);
+
+	packet_number = len / packet_size;
+	remainder = len % packet_size;
+	if (remainder)
+		packet_number++;
+	packet_len = packet_size;
+
+	cmd[0] = FTS_ROMBOOT_CMD_WRITE;
+	for (i = 0; i < packet_number; i++) {
+		offset = i * packet_size;
+		addr = saddr + offset;
+		cmd[1] = (addr >> 16) & 0xFF;
+		cmd[2] = (addr >> 8) & 0xFF;
+		cmd[3] = addr & 0xFF;
+
+		if (i == packet_number - 1 && remainder)
+			packet_len = remainder;
+		cmd[4] = (packet_len >> 8) & 0xFF;
+		cmd[5] = packet_len & 0xFF;
+
+		for (j = 0; j < packet_len; j++)
+			cmd[FTS_CMD_WRITE_LEN + j] = buf[offset + j];
+
+		ret = fts_write(data, cmd, FTS_CMD_WRITE_LEN + packet_len);
+		if (ret < 0) {
+			vfree(cmd);
+			return ret;
+		}
+		if (!fd_support)
+			mdelay(3);
+	}
+
+	vfree(cmd);
+	return 0;
+}
+
+static int fts_ecc_cal_tp(struct fts_ts_data *data, u32 ecc_saddr, u32 ecc_len, u16 *ecc_value)
+{
+	int ret, i;
+	u8 cmd[FTS_ROMBOOT_CMD_ECC_NEW_LEN] = { 0 };
+	u8 value[2] = { 0 };
+
+	cmd[0] = FTS_ROMBOOT_CMD_ECC;
+	cmd[1] = (ecc_saddr >> 16) & 0xFF;
+	cmd[2] = (ecc_saddr >> 8) & 0xFF;
+	cmd[3] = ecc_saddr & 0xFF;
+	cmd[4] = (ecc_len >> 16) & 0xFF;
+	cmd[5] = (ecc_len >> 8) & 0xFF;
+	cmd[6] = ecc_len & 0xFF;
+
+	ret = fts_write(data, cmd, FTS_ROMBOOT_CMD_ECC_NEW_LEN);
+	if (ret < 0)
+		return ret;
+	mdelay(2);
+
+	cmd[0] = FTS_ROMBOOT_CMD_ECC_FINISH;
+	for (i = 0; i < FTS_ECC_FINISH_TIMEOUT; i++) {
+		ret = fts_read(data, cmd, 1, value, 1);
+		if (ret < 0)
+			return ret;
+		if (FT8719_ECC_OK == value[0])
+			break;
+		mdelay(1);
+	}
+	if (i >= FTS_ECC_FINISH_TIMEOUT)
+		return -EIO;
+
+	cmd[0] = FTS_ROMBOOT_CMD_ECC_READ;
+	ret = fts_read(data, cmd, 1, value, 2);
+	if (ret < 0)
+		return ret;
+
+	*ecc_value = ((u16)(value[0] << 8) + value[1]) & 0xFFFF;
+	return 0;
+}
+
+static int fts_ecc_cal_host(const u8 *d, u32 len, u16 *ecc_value)
+{
+	u16 ecc = 0;
+	u32 i;
+	u16 j;
+
+	for (i = 0; i < len; i += 2) {
+		ecc ^= (u16)((d[i] << 8) | d[i + 1]);
+		for (j = 0; j < 16; j++)
+			ecc = (ecc & 0x01) ? (u16)((ecc >> 1) ^ AL2_FCS_COEF) : (ecc >> 1);
+	}
+	*ecc_value = ecc & 0xFFFF;
+	return 0;
+}
+
+static int fts_ecc_check(struct fts_ts_data *data, const u8 *buf, u32 len, u32 ecc_saddr)
+{
+	int i, ret;
+	u16 ecc_host = 0, ecc_tp = 0;
+	u32 offset = 0;
+	u32 packet_size = FT8719_ECCLEN_MAX;
+	u32 packet_number = len / packet_size;
+	u32 packet_remainder = len % packet_size;
+	u32 packet_length = packet_size;
+
+	if (packet_remainder)
+		packet_number++;
+
+	for (i = 0; i < packet_number; i++) {
+		if (i == packet_number - 1 && packet_remainder)
+			packet_length = packet_remainder;
+
+		ret = fts_ecc_cal_host(buf + offset, packet_length, &ecc_host);
+		if (ret < 0)
+			return ret;
+		ret = fts_ecc_cal_tp(data, ecc_saddr + offset, packet_length, &ecc_tp);
+		if (ret < 0)
+			return ret;
+		if (ecc_tp != ecc_host) {
+			dev_err(&data->spi->dev, "ecc mismatch tp:%04x host:%04x\n",
+				ecc_tp, ecc_host);
+			return -EIO;
+		}
+		offset += packet_length;
+	}
+	return 0;
+}
+
+static int fts_pram_write_ecc(struct fts_ts_data *data, const u8 *buf, u32 len)
+{
+	int ret;
+	u32 pram_app_size;
+	u16 code_len, code_len_n;
+
+	code_len = ((u16)buf[FTS_APP_INFO_OFFSET + 0] << 8) + buf[FTS_APP_INFO_OFFSET + 1];
+	code_len_n = ((u16)buf[FTS_APP_INFO_OFFSET + 2] << 8) + buf[FTS_APP_INFO_OFFSET + 3];
+	if ((code_len + code_len_n) != 0xFFFF) {
+		dev_err(&data->spi->dev, "pram code len fail (%x %x)\n", code_len, code_len_n);
+		return -EINVAL;
+	}
+	pram_app_size = code_len;
+
+	ret = fts_dpram_write_pe(data, 0, buf, pram_app_size);
+	if (ret < 0)
+		return ret;
+
+	ret = fts_ecc_check(data, buf, pram_app_size, 0);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int fts_pram_start(struct fts_ts_data *data)
+{
+	u8 cmd = FTS_ROMBOOT_CMD_START_APP;
+	return fts_write(data, &cmd, 1);
+}
+
+static int fts_fw_write_start(struct fts_ts_data *data, const u8 *buf, u32 len)
+{
+	int ret;
+
+	data->fw_is_running = false;
+
+	ret = fts_enter_into_boot(data);
+	if (ret < 0)
+		return ret;
+
+	ret = fts_pram_write_ecc(data, buf, len);
+	if (ret < 0)
+		return ret;
+
+	ret = fts_pram_start(data);
+	if (ret < 0)
+		return ret;
+
+	data->fw_is_running = true;
+	return 0;
+}
+
+static int fts_fw_download(struct fts_ts_data *data, const u8 *buf, u32 len)
+{
+	int ret, i;
+
+	if (!buf || len < FTS_MIN_LEN)
+		return -EINVAL;
+
+	disable_irq(data->irq);
+	for (i = 0; i < 3; i++) {
+		ret = fts_fw_write_start(data, buf, len);
+		if (ret == 0)
+			break;
+	}
+	enable_irq(data->irq);
+
+	if (i >= 3)
+		return -EIO;
+
+	return 0;
+}
+
+static void fts_fw_work(struct work_struct *work)
+{
+	struct fts_ts_data *data = container_of(work, struct fts_ts_data, fw_work);
+	const struct firmware *fw = NULL;
+	int ret, i;
+
+	for (i = 0; i < 10; i++) {
+		ret = request_firmware(&fw, FW_NAME, data->dev);
+		if (ret == 0)
+			break;
+		dev_dbg(data->dev, "firmware not ready (retry %d): %d\n", i, ret);
+		msleep(2000);
+	}
+	if (ret) {
+		dev_err(data->dev, "request firmware %s failed: %d\n", FW_NAME, ret);
+		return;
+	}
+
+	ret = fts_fw_download(data, fw->data, fw->size);
+	if (ret)
+		dev_err(data->dev, "fw download failed: %d\n", ret);
+	else {
+		u8 chip_id = 0, fw_ver = 0;
+		dev_info(data->dev, "fw downloaded (%zu bytes)\n", fw->size);
+		msleep(50);
+		fts_read_reg(data, FTS_REG_CHIP_ID, &chip_id);
+		fts_read_reg(data, FTS_REG_FW_VER, &fw_ver);
+		dev_info(data->dev, "after fw: chip_id=0x%02x fw_ver=0x%02x\n", chip_id, fw_ver);
+	}
+
+	release_firmware(fw);
+}
+
+/* ---- touch report ---- */
+
+static int fts_read_touchdata(struct fts_ts_data *data)
+{
+	u8 *buf = data->point_buf;
+
+	memset(buf, 0xFF, data->pnt_buf_size);
+	buf[0] = 0x01;
+
+	fts_read(data, NULL, 0, buf + 1, data->pnt_buf_size - 1);
+
+	if ((buf[1] & 0xF0) != 0x90) {
+		dev_err(&data->spi->dev, "touch data abnormal: %x\n", buf[1]);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int fts_report_touch(struct fts_ts_data *data)
+{
+	struct input_dev *input_dev = data->input_dev;
+	u8 *buf = data->point_buf;
+	int point_num, i, base;
+	u8 pointid, type;
+	int x, y, p, area;
+
+	if (fts_read_touchdata(data))
+		return -EIO;
+
+	point_num = buf[FTS_TOUCH_POINT_NUM] & 0x0F;
+	if (point_num > FTS_MAX_POINTS)
+		return -EIO;
+
+	for (i = 0; i < FTS_MAX_POINTS; i++) {
+		base = FTS_ONE_TCH_LEN * i;
+		pointid = buf[FTS_TOUCH_ID_POS + base] >> 4;
+		if (pointid >= FTS_MAX_ID)
+			break;
+
+		x = ((buf[FTS_TOUCH_X_H_POS + base] & 0x0F) << 8) + buf[FTS_TOUCH_X_L_POS + base];
+		y = ((buf[FTS_TOUCH_Y_H_POS + base] & 0x0F) << 8) + buf[FTS_TOUCH_Y_L_POS + base];
+		p = buf[FTS_TOUCH_PRE_POS + base];
+		area = buf[FTS_TOUCH_AREA_POS + base] >> 4;
+		type = buf[FTS_TOUCH_EVENT_POS + base] >> 6;
+
+		input_mt_slot(input_dev, pointid);
+		if (EVENT_DOWN(type)) {
+			input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, true);
+			touchscreen_report_pos(input_dev, &data->prop, x, y, true);
+			input_report_abs(input_dev, ABS_MT_PRESSURE, p);
+			input_report_abs(input_dev, ABS_MT_TOUCH_MAJOR, area);
+		} else {
+			input_mt_report_slot_inactive(input_dev);
+		}
+	}
+
+	input_mt_sync_frame(input_dev);
+	input_sync(input_dev);
+	return 0;
+}
+
+static irqreturn_t fts_irq_handler(int irq, void *dev_id)
+{
+	struct fts_ts_data *data = dev_id;
+
+	if (fts_report_touch(data) == 0)
+		return IRQ_HANDLED;
+	return IRQ_NONE;
+}
+
+static int fts_input_init(struct fts_ts_data *data)
+{
+	struct input_dev *input_dev;
+	int ret;
+
+	input_dev = devm_input_allocate_device(data->dev);
+	if (!input_dev)
+		return -ENOMEM;
+
+	data->input_dev = input_dev;
+	input_dev->name = FTS_DRIVER_NAME;
+	input_dev->id.bustype = BUS_SPI;
+	input_dev->dev.parent = data->dev;
+
+	input_set_capability(input_dev, EV_ABS, ABS_MT_POSITION_X);
+	input_set_capability(input_dev, EV_ABS, ABS_MT_POSITION_Y);
+	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
+	input_set_abs_params(input_dev, ABS_MT_PRESSURE, 0, 255, 0, 0);
+	input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+
+	touchscreen_parse_properties(input_dev, true, &data->prop);
+	if (!data->prop.max_x || !data->prop.max_y) {
+		dev_err(data->dev, "missing touchscreen-size-x/y\n");
+		return -EINVAL;
+	}
+
+	ret = input_mt_init_slots(input_dev, FTS_MAX_POINTS, INPUT_MT_DIRECT);
+	if (ret)
+		return ret;
+
+	return input_register_device(input_dev);
+}
+
+static int fts_parse_dt(struct fts_ts_data *data)
+{
+	struct device *dev = data->dev;
+
+	data->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(data->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(data->reset_gpio),
+				     "failed to get reset gpio\n");
+
+	data->irq = of_irq_get(dev->of_node, 0);
+	if (data->irq < 0)
+		return dev_err_probe(dev, data->irq, "failed to get irq\n");
+
+	return 0;
+}
+
+static int fts_probe(struct spi_device *spi)
+{
+	struct fts_ts_data *data;
+	int ret;
+
+	spi->max_speed_hz = 6000000;
+	spi->mode = SPI_MODE_1;
+	spi->bits_per_word = 8;
+	ret = spi_setup(spi);
+	if (ret)
+		return ret;
+
+	data = devm_kzalloc(&spi->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	data->spi = spi;
+	data->dev = &spi->dev;
+	mutex_init(&data->bus_lock);
+	fts_data = data;
+	spi_set_drvdata(spi, data);
+
+	data->bus_tx_buf = devm_kzalloc(&spi->dev, SPI_BUF_LENGTH, GFP_KERNEL);
+	data->bus_rx_buf = devm_kzalloc(&spi->dev, SPI_BUF_LENGTH, GFP_KERNEL);
+	if (!data->bus_tx_buf || !data->bus_rx_buf)
+		return -ENOMEM;
+
+	data->pnt_buf_size = FTS_TOUCH_DATA_LEN;
+	data->point_buf = devm_kzalloc(&spi->dev, data->pnt_buf_size, GFP_KERNEL);
+	if (!data->point_buf)
+		return -ENOMEM;
+
+	ret = fts_parse_dt(data);
+	if (ret)
+		return ret;
+
+	ret = fts_input_init(data);
+	if (ret)
+		return ret;
+
+	ret = fts_get_ic_information(data);
+	if (ret)
+		return ret;
+
+	ret = devm_request_threaded_irq(&spi->dev, data->irq, NULL,
+					fts_irq_handler,
+					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+					"fts", data);
+	if (ret)
+		return ret;
+
+	INIT_WORK(&data->fw_work, fts_fw_work);
+	schedule_work(&data->fw_work);
+
+	return 0;
+}
+
+static void fts_remove(struct spi_device *spi)
+{
+	struct fts_ts_data *data = spi_get_drvdata(spi);
+
+	cancel_work_sync(&data->fw_work);
+}
+
+static const struct of_device_id fts_of_match[] = {
+	{ .compatible = "focaltech,ft8719", },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, fts_of_match);
+
+static const struct spi_device_id fts_id[] = {
+	{ "fts_ts", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, fts_id);
+
+static struct spi_driver fts_spi_driver = {
+	.driver = {
+		.name = FTS_DRIVER_NAME,
+		.of_match_table = fts_of_match,
+	},
+	.id_table = fts_id,
+	.probe = fts_probe,
+	.remove = fts_remove,
+};
+module_spi_driver(fts_spi_driver);
+
+MODULE_DESCRIPTION("FocalTech FT8719 SPI touchscreen driver");
+MODULE_AUTHOR("FocalTech Systems / XiaoMi / postmarketOS");
+MODULE_LICENSE("GPL");

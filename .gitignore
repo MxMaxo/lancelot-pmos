@@ -1,0 +1,22 @@
+# Upstream-клоны (не часть этого репозитория)
+/linux-mt6768/
+/pmbootstrap/
+
+# Проприетарные firmware-блобы (извлекаются из собственного устройства)
+lancelot/extracted/
+
+# Крупные/воспроизводимые артефакты сборки
+lancelot/flash/
+lancelot/kernel_r*/
+
+# Сторонние инструменты и бинарники
+lancelot/tools/
+lancelot/avbtool.py
+lancelot/avbtool.b64
+
+# Downstream-референс (копия апстрим-кода GPL)
+lancelot/ft8719_downstream/
+
+# Прочее
+*.pyc
+__pycache__/
