@@ -9,6 +9,8 @@
 ```
 lancelot/
 ├── 0001-ft8719-touch.patch       # ПАТЧ (главное): драйвер + Kconfig + Makefile + DTS
+├── config.fragment               # 3 строки конфига ядра (тач + evdev + BTF-mismatch)
+├── deviceinfo.patch              # правка dtb в device-пакете (tianma-ti → huaxing-ktd)
 ├── focaltech_ft8719.c            # исходник портированного драйвера (для справки)
 ├── avbtool.py                    # AVB-инструмент (из AOSP external/avb)
 ├── ft8719_downstream/            # downstream-драйвер MTK FT8719P (референс, GPL-2.0)

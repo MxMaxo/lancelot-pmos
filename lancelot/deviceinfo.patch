@@ -1,0 +1,5 @@
+--- a/deviceinfo
++++ b/deviceinfo
+@@ -10 +10 @@
+-deviceinfo_dtb="mediatek/mt6769t-xiaomi-lancelot-tianma-ti"
++deviceinfo_dtb="mediatek/mt6769t-xiaomi-lancelot-huaxing-ktd"

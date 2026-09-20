@@ -19,21 +19,26 @@ SSH по USB. Подробный статус и пошаговая инстру
 |---|---|
 | `lancelot-pmos-guide.md` | Полный гайд: от разблокировки до рабочего устройства + все грабли |
 | `lancelot/0001-ft8719-touch.patch` | **Патч ядра**: драйвер + Kconfig + Makefile + touch-нода в DTS |
+| `lancelot/config.fragment` | 3 строки конфига ядра (тач + evdev + BTF) |
+| `lancelot/deviceinfo.patch` | Правка dtb в device-пакете (tianma-ti → huaxing-ktd) |
 | `lancelot/focaltech_ft8719.c` | Исходник портированного драйвера (для справки) |
 | `lancelot/README.md` | Описание артефактов |
 
-## Быстрый старт
+## Быстрый старт — что нужно, чтобы заработал тач
 
-1. Применить патч к ядру `mt6768-mainline/linux` @ `781287a2` (6.16.0).
-2. Включить в конфиге:
-   ```
-   CONFIG_TOUCHSCREEN_FOCALTECH_FT8719=y
-   CONFIG_INPUT_EVDEV=y
-   CONFIG_MODULE_ALLOW_BTF_MISMATCH=y
-   ```
-3. В device-пакете: `deviceinfo_dtb="...huaxing-ktd"`.
-4. Извлечь прошивку тача `focaltech_ts_fw_huaxing.bin` из `/vendor/firmware`
-   своего устройства (нужен root) и положить в `/lib/firmware/`.
+1. **Патч ядра** `lancelot/0001-ft8719-touch.patch` — применить к
+   `mt6768-mainline/linux` @ `781287a2` (6.16.0): добавляет драйвер
+   `focaltech_ft8719.c`, регистрацию в Kconfig/Makefile и touch-ноду
+   `focaltech,ft8719` в `huaxing.dtsi`.
+2. **Конфиг** `lancelot/config.fragment` — дописать 3 строки в
+   `config-postmarketos-mediatek-mt6768.aarch64` (тач, evdev, BTF-mismatch).
+3. **deviceinfo** `lancelot/deviceinfo.patch` — сменить dtb на
+   `huaxing-ktd` в device-пакете.
+4. **Прошивка тача** `focaltech_ts_fw_huaxing.bin` — извлечь из `/vendor/firmware`
+   своего устройства (нужен root) и положить в `/lib/firmware/` (проприетарный
+   блоб, поэтому **не** в репозитории).
+5. **cmdline** — добавить `clk_ignore_unused pd_ignore_unused` в boot.img
+   (иначе дисплей не работает). Подробности — в гайде.
 
 Полная процедура (включая прошивку, AVB-footer, rootfs в super и пр.) — в гайде.
 

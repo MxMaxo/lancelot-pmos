@@ -1,0 +1,13 @@
+# Фрагмент конфига ядра linux-postmarketos-mediatek-mt6768
+#
+# Применение: дописать эти 3 строки в конец
+#   device/testing/linux-postmarketos-mediatek-mt6768/config-postmarketos-mediatek-mt6768.aarch64
+#
+# (или через `cat config.fragment >> <config>`)
+
+# Драйвер тача Focaltech FT8719 (из 0001-ft8719-touch.patch)
+CONFIG_TOUCHSCREEN_FOCALTECH_FT8719=y
+# Без этого нет /dev/input/eventX: evdev=m не грузится из-за BTF-mismatch
+CONFIG_INPUT_EVDEV=y
+# Иначе модули падают "failed to validate module BTF: -22"
+CONFIG_MODULE_ALLOW_BTF_MISMATCH=y
