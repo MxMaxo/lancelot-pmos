@@ -124,32 +124,51 @@ SSH-ключ: `~/.ssh/phone` (ed25519), логин `maxi`, пароль `pmos`, 
 
 ---
 
-## 6. ⚠️ ТЕКУЩИЙ БЛОКЕР — PMIC IRQ-шторм (НЕ РЕШЁН)
+## 6. PMIC IRQ-шторм — НАСТОЯЩАЯ ПРИЧИНА НАЙДЕНА (фикс в r17, проверяй)
 
-**Симптом:** `mt6358-irq` (IRQ 172 / EINT 144) генерирует ~25 000 прерываний/сек
-(`cat /proc/interrupts | grep mt6358-irq` → счётчик растёт на ~25K/с). Это даёт
-14–22% CPU и вызывает **случайные зависания/перезагрузки**.
+**Симптом:** `mt6358-irq` (IRQ 172 / EINT 144) генерирует ~25–39K прерываний/сек
+→ 14–22% CPU и **случайные зависания/перезагрузки**.
 
-**Что уже сделано (в патче r15):** применил оба патча hataketsu
-(`hataketsu/mt6768-mainline-notes` → `kernel-patches/pmic-irq/`):
-- `0001-mfd-mt6358-fix-top-level-irq-offsets.patch` (offset fix — применяется чисто)
-- `0002-mfd-mt6358-no-unserviced-irq-storm.patch` (маскировка unserviced групп —
-  пришлось **вручную адаптировать** хунк `mt6358_irq_init` под 6.16:
-  `irq_domain_create_linear(of_fwnode_handle(chip->dev->of_node), ...)` вместо
-  `dev_fwnode(chip->dev)` из 6.18).
+**Разбор hataketsu (файлы скачаны в `lancelot/hataketsu_patches/`):**
+- `pmic-irq-storm.diff` (5988 Б) = это ТО ЖЕ САМОЕ, что 0001+0002 вместе
+  (XPP-offset fix + маскировка unserviced групп + disable unclaimed). Уже было
+  в патче r15/r16. Нового там нет.
+- **`PMIC-IRQ-STORM.vi.md` (вьетнамский) — вот ключ.** Итог его измерений на
+  железе:
+  1. Найден и исправлен РЕАЛЬНЫЙ баг mainline: в `mt6358/core.h` пропущена группа
+     `XPP` (bit 6), из-за чего AUD/MISC сдвинуты на 1 бит. Это НЕ причина шторма,
+     но баг настоящий (подтверждён железом: `TOP_INT_MASK_CON0 = 0x0040`).
+  2. **PMIC полностью невиновен**: все `TOP_INT_STATUS0/RAW/INT_STA = 0x0000`,
+     32 последовательных чтения — ни одного бита. PMIC не тянет линию.
+  3. Настоящая причина — **полярность выхода прерывания PMIC**. Регистр
+     `RG_INT_POLARITY` = `MT6358_TOP_INT_CON0` @ `0x1a2` bit0. На lancelot он = 0
+     (active-LOW), а SoC ждёт `IRQ_TYPE_LEVEL_HIGH`. Линия «покоится» в HIGH →
+     вечный шторм. Ни один downstream-драйвер этот регистр не пишет (0 — либо
+     reset-default, либо ставит LK; mainline-u-boot отличается от Android LK).
+  4. EINT-сторона SoC исключена: `EINT_SOFT bit16=0` (не софт-прерывание от
+     бутлоадера), `EINT_POL bit16=1` (active-high — правильно), все board в
+     mainline используют LEVEL_HIGH.
 
-**НО шторм ВСЁ ЕЩЁ ЕСТЬ (~26K/с после r15).** Причина не устранена. По записям
-hataketsu: «найден и исправлен реальный баг mainline — но он НЕ причина шторма».
-В его репозитории есть ТРЕТИЙ файл **`pmic-irq-storm.diff`** (5988 байт) и док
-**`docs/PMIC-IRQ-STORM.vi.md`** (вьетнамский) — это, вероятно, ключ к настоящей
-причине. Скачай их:
+**ФИКС (реализован в r17, ЕЩЁ НЕ ПРОВЕРЕН на железе):**
+в `drivers/mfd/mt6358-irq.c` → `mt6358_irq_init()`, до `request_threaded_irq`:
+```c
+if (chip->chip_id == MT6358_CHIP_ID || chip->chip_id == MT6366_CHIP_ID)
+    regmap_update_bits(chip->regmap, MT6358_TOP_INT_CON0, 0x1, 0x1);
 ```
-https://raw.githubusercontent.com/hataketsu/mt6768-mainline-notes/master/kernel-patches/pmic-irq/pmic-irq-storm.diff
-https://raw.githubusercontent.com/hataketsu/mt6768-mainline-notes/master/docs/PMIC-IRQ-STORM.vi.md
-```
-Изучи `pmic-irq-storm.diff` и проверь, маскируются ли/чистятся ли нужные биты.
-Гипотеза: какой-то источник (например, от загрузчика оставлен включённым) держит
-уровень, и его надо маскировать в TOP_INT_MASK или отключить в en_reg конкретной группы.
+плюс `#define MT6358_TOP_INT_CON0 0x1a2` в `include/linux/mfd/mt6358/registers.h`.
+
+**Проверка после прошивки r17:** `cat /proc/interrupts | grep mt6358-irq` —
+счётчик должен перестать расти (~единицы/с), `irq/172-mt6358-irq` в top ≈ 0%.
+
+**План Б, если фикс не сработал** (модуль-диагностика, как у hataketsu §6.2):
+собрать `mt6358_eintpol.ko` с режимами:
+- `mode=1` — перевести EINT144 в active-low на стороне SoC (`pol_clr`): если
+  счётчик встал → линия реально на HIGH (проблема полярности, подтверждает §6).
+- `mode=3` — писать `RG_INT_POLARITY=1` (то же, что делает фикс, но в рантайме
+  для проверки без пересборки ядра).
+
+Полный разбор: `lancelot/hataketsu_patches/PMIC-IRQ-STORM.vi.md` (переводится
+Google Translate, вьетнамский).
 
 ---
 
@@ -163,7 +182,8 @@ https://raw.githubusercontent.com/hataketsu/mt6768-mainline-notes/master/docs/PM
 
 ## 8. Следующие шаги (приоритет)
 
-1. **Добить PMIC IRQ-шторм** (главное — иначе случайные ребуты) — см. §6.
+1. **Проверить фикс PMIC IRQ-шторма (r17)** — прошить и убедиться, что IRQ 172
+   больше не растёт (см. §6). Это главное, иначе случайные ребуты.
 2. **Батарея/зарядка** — патчи `hataketsu/mt6768-mainline-notes` →
    `kernel-patches/battery/*.patch` + драйвер SMB1351 (его нет в mainline).
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже

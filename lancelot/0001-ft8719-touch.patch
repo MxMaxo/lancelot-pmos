@@ -1061,7 +1061,7 @@ index 000000000..f40cdeb1f
 +MODULE_AUTHOR("FocalTech Systems / XiaoMi / postmarketOS");
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/mfd/mt6358-irq.c b/drivers/mfd/mt6358-irq.c
-index 9f0bcc3ad..bb8e0b4ec 100644
+index 9f0bcc3ad..9ccabca1b 100644
 --- a/drivers/mfd/mt6358-irq.c
 +++ b/drivers/mfd/mt6358-irq.c
 @@ -55,6 +55,7 @@ static struct pmic_irq_data mt6357_irqd = {
@@ -1171,7 +1171,7 @@ index 9f0bcc3ad..bb8e0b4ec 100644
  	int i, j, ret;
  	struct pmic_irq_data *irqd;
  
-@@ -265,13 +304,26 @@ int mt6358_irq_init(struct mt6397_chip *chip)
+@@ -265,13 +304,38 @@ int mt6358_irq_init(struct mt6397_chip *chip)
  		return -ENOMEM;
  
  	/* Disable all interrupts for initializing */
@@ -1194,6 +1194,18 @@ index 9f0bcc3ad..bb8e0b4ec 100644
 +	dev_info(chip->dev, "PMIC top mask: reg %#x val %#x (chip 0x%x)\n",
 +		 irqd->top_int_mask_set_reg, top_mask, chip->chip_id);
 +	regmap_write(chip->regmap, irqd->top_int_mask_set_reg, top_mask);
++
++	/*
++	 * Every mainline device tree requests the MT6358/MT6366 parent
++	 * interrupt as IRQ_TYPE_LEVEL_HIGH (active-high), but the interrupt
++	 * output polarity is configurable via RG_INT_POLARITY (TOP_INT_CON0
++	 * bit 0).  Its reset value is active-low on the Xiaomi Redmi 9
++	 * (lancelot), whose downstream bootloader does not program it, so the
++	 * line rests high and the level-high SoC sees a permanent interrupt
++	 * storm.  Force active-high to match the device tree.
++	 */
++	if (chip->chip_id == MT6358_CHIP_ID || chip->chip_id == MT6366_CHIP_ID)
++		regmap_update_bits(chip->regmap, MT6358_TOP_INT_CON0, 0x1, 0x1);
 +
  	chip->irq_domain = irq_domain_create_linear(of_fwnode_handle(chip->dev->of_node),
  						    irqd->num_pmic_irqs,
@@ -1219,17 +1231,19 @@ index 68578e201..7d1992875 100644
  	MT6358_MISC_TOP,
  };
 diff --git a/include/linux/mfd/mt6358/registers.h b/include/linux/mfd/mt6358/registers.h
-index d83e87298..8eefc55cb 100644
+index d83e87298..1cdeebc12 100644
 --- a/include/linux/mfd/mt6358/registers.h
 +++ b/include/linux/mfd/mt6358/registers.h
-@@ -12,6 +12,7 @@
+@@ -12,7 +12,9 @@
  #define MT6358_TOP_RST_MISC                   0x14c
  #define MT6358_MISC_TOP_INT_CON0              0x188
  #define MT6358_MISC_TOP_INT_STATUS0           0x194
 +#define MT6358_TOP_INT_MASK_CON0_SET          0x19a
  #define MT6358_TOP_INT_STATUS0                0x19e
++#define MT6358_TOP_INT_CON0                   0x1a2
  #define MT6358_SCK_TOP_INT_CON0               0x52e
  #define MT6358_SCK_TOP_INT_STATUS0            0x53a
+ #define MT6358_EOSC_CALI_CON0                 0x540
 diff --git a/include/linux/mfd/mt6359/registers.h b/include/linux/mfd/mt6359/registers.h
 index 2a4394a27..1bdddd6f9 100644
 --- a/include/linux/mfd/mt6359/registers.h
