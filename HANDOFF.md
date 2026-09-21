@@ -137,6 +137,39 @@ SSH-ключ: `~/.ssh/phone` (ed25519), логин `maxi`, пароль `pmos`, 
 
 ---
 
+## 5b. Сборка ядра БЕЗ sudo (workaround для `no_new_privs`)
+
+`sudo` в окружении сломан (флаг `NoNewPrivs: 1`), поэтому `pmbootstrap build`
+(которому нужен sudo для chroot) не работает. Обход — **unshare user+mount
+namespace + chroot прямо в `chroot_native`** (там уже стоит clang/lld/llvm-*,
+pahole, zstd, mkdtboimg). Проверено: ядро 6.16 собирается полностью, `sudo` не нужен.
+
+```bash
+# 1) конфиг (если ещё нет .config):
+cp ~/.local/var/pmbootstrap/cache_git/pmaports/device/testing/linux-postmarketos-mediatek-mt6768/config-postmarketos-mediatek-mt6768.aarch64 \
+   ~/Документи/Default\ Project/linux-mt6768/.config
+
+# 2) полная сборка:
+CH="/home/maxi/.local/var/pmbootstrap/chroot_native"
+SRC="/home/maxi/Документи/Default Project/linux-mt6768"
+unshare --user --map-root-user --mount --pid --fork -- sh -c '
+  mount --bind "$1" "$2/mnt"
+  chroot "$2" /bin/sh -c "cd /mnt && make ARCH=arm64 LLVM=1 HOSTLDFLAGS=\"-fuse-ld=lld\" olddefconfig"
+  chroot "$2" /bin/sh -c "cd /mnt && make ARCH=arm64 LLVM=1 HOSTLDFLAGS=\"-fuse-ld=lld\" -j\$(nproc)"
+' _ "$SRC" "$CH"
+```
+
+Итог: `arch/arm64/boot/Image.gz` (это vmlinuz) и
+`arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-lancelot-huaxing-ktd.dtb`.
+Дальше сборка boot.img — как в §5 (unpack ramdisk из старого boot.img →
+`mkbootimg.py` → `avbtool.py add_hash_footer`). Готовый образ:
+`flash/boot_touch_r22.img` (уже собран и подписан, включает SMB1351).
+
+Одиночную цель для быстрой проверки драйвера можно собрать так же, заменив `make …` на
+`make … drivers/power/supply/smb1351-charger.o`.
+
+---
+
 ## 6. PMIC IRQ-шторм — ПРИЧИНА НАЙДЕНА, но фикс вскрывает зависание (см. §6b)
 
 **Симптом:** `mt6358-irq` (IRQ 172 / EINT 144) генерирует ~25–39K прерываний/сек
@@ -216,13 +249,15 @@ mainline не просыпается → CPU-кластер зависает. GP
 
 1. **Проверить r21** (LEVEL_LOW + без cluster-sleep + батарея): стабильно 10+ мин,
    IRQ 172 = 0/с, `cat /sys/class/power_supply/fuel-gauge/capacity` → % заряда.
-2. **Зарядка (SMB1351)** — написан минимальный драйвер `drivers/power/supply/smb1351-charger.c`
-   (в патче), узел `&i2c7 { smb1351: charger@55 }` в DTS, `CONFIG_CHARGER_SMB1351=y`.
-   **НЕ СОБРАН/НЕ ПРОВЕРЕН**: сборка заблокирована (в окружении сломан `sudo` →
-   `no_new_privs`, pmbootstrap не может собрать). Дальше:
-   `pmbootstrap build linux-postmarketos-mediatek-mt6768`, прошить, и проверить
-   `cat /sys/class/power_supply/smb1351-charger/*` + статус батареи при подключении
-   зарядки. См. §6b-спутник ниже и `lancelot/0001-ft8719-touch.patch`.
+2. **Зарядка (SMB1351)** — драйвер `drivers/power/supply/smb1351-charger.c` (в патче),
+   узел `&i2c7 { smb1351: charger@55 }` в DTS, `CONFIG_CHARGER_SMB1351=y`.
+   **СОБРАН (без sudo, см. §5b), компилируется чисто (0 warning), драйвер в vmlinux.**
+   НЕ ПРОВЕРЕН НА ЖЕЛЕЗЕ. Готовый boot.img: `flash/boot_touch_r22.img` (ядро + dtb с
+   нодой smb1351, старый ramdisk/cmdline, AVB). Прошить (см. §5) и проверить:
+   `ls /sys/class/power_supply/` (должен появиться `smb1351-charger`),
+   `cat /sys/class/power_supply/smb1351-charger/{online,status}`,
+   подключить зарядку → батарея должна показывать `Charging`.
+   См. `lancelot/0001-ft8719-touch.patch`.
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже
    извлечены в `lancelot/extracted/firmware/` (WIFI_RAM_CODE_soc1_0_1a_1.bin и др.).
 4. **Аудио** — mt6358 DAI-обвязка.
