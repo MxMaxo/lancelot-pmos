@@ -1,0 +1,41 @@
+From: Kernel porting effort <hunganh.dev@gmail.com>
+Subject: [PATCH 1/2] mfd: mt6358: Fix the AUD and MISC top level interrupt offsets
+
+The MT6358 aggregates its interrupt sources into nine top level groups,
+whose pending state is reported by one bit each in TOP_INT_STATUS0:
+
+  BUCK=0 LDO=1 PSC=2 SCK=3 BM=4 HK=5 XPP=6 AUD=7 MISC=8
+
+enum mt6358_irq_top_status_shift is missing the XPP group, so AUD is
+described as bit 6 and MISC as bit 7, i.e. both are off by one.
+
+As a consequence mt6358_irq_handler() decodes TOP_INT_STATUS0 wrongly for
+those two groups: an asserted AUD group (bit 7) makes it read and
+acknowledge the MISC status registers instead, an asserted XPP group
+(bit 6) makes it read the AUD ones, and the real MISC group (bit 8) is
+never looked at at all. Since the parent interrupt is level triggered,
+any of these leaves the interrupt asserted and retriggering forever.
+
+The two sibling PMICs already get this right: mt6357_irq_top_status_shift
+lists MT6357_XPP_TOP between HK and AUD, and mt6359_irq_top_status_shift
+skips bit 6 by assigning MT6359_AUD_TOP = 7 explicitly. The vendor
+driver uses the same numbering for the MT6358.
+
+Add the missing MT6358_XPP_TOP so that AUD and MISC land on bits 7 and 8.
+
+Fixes: 4cfc2ca2a5c7 ("mfd: Add support for the MediaTek MT6358 PMIC")
+Signed-off-by: Kernel porting effort <hunganh.dev@gmail.com>
+---
+ include/linux/mfd/mt6358/core.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/include/linux/mfd/mt6358/core.h
++++ b/include/linux/mfd/mt6358/core.h
+@@ -32,6 +32,7 @@ enum mt6358_irq_top_status_shift {
+ 	MT6358_SCK_TOP,
+ 	MT6358_BM_TOP,
+ 	MT6358_HK_TOP,
++	MT6358_XPP_TOP,
+ 	MT6358_AUD_TOP,
+ 	MT6358_MISC_TOP,
+ };
