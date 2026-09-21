@@ -1459,10 +1459,10 @@ index 4f5f8e350..7bb042db0 100644
  obj-$(CONFIG_CHARGER_TPS65217)	+= tps65217_charger.o
  obj-$(CONFIG_AXP288_FUEL_GAUGE) += axp288_fuel_gauge.o
 diff --git a/drivers/power/supply/generic-adc-battery.c b/drivers/power/supply/generic-adc-battery.c
-index f5f2566b3..978adc2f9 100644
+index f5f2566b3..93146cd2b 100644
 --- a/drivers/power/supply/generic-adc-battery.c
 +++ b/drivers/power/supply/generic-adc-battery.c
-@@ -18,10 +18,17 @@
+@@ -18,10 +18,20 @@
  #include <linux/iio/consumer.h>
  #include <linux/iio/types.h>
  #include <linux/of.h>
@@ -1477,18 +1477,26 @@ index f5f2566b3..978adc2f9 100644
 + */
 +#define GAB_DEFAULT_TEMP_C 25
 +
++/* Voltage smoothing poll interval (ms). */
++#define GAB_POLL_INTERVAL_MS (10 * 1000)
++
  enum gab_chan_type {
  	GAB_VOLTAGE = 0,
  	GAB_CURRENT,
-@@ -48,6 +55,7 @@ struct gab {
+@@ -47,7 +57,12 @@ struct gab {
+ 	struct iio_channel *channel[GAB_MAX_CHAN_TYPE];
  	struct delayed_work bat_work;
  	int status;
++	/* EMA-smoothed battery voltage (uV) and derived capacity (%) */
++	int avg_voltage_uv;
++	int capacity;
++	bool voltage_valid;
  	struct gpio_desc *charge_finished;
 +	struct power_supply_battery_info *info;
  };
  
  static struct gab *to_generic_bat(struct power_supply *psy)
-@@ -66,6 +74,19 @@ static const enum power_supply_property gab_props[] = {
+@@ -66,6 +81,19 @@ static const enum power_supply_property gab_props[] = {
  	POWER_SUPPLY_PROP_STATUS,
  };
  
@@ -1508,7 +1516,7 @@ index f5f2566b3..978adc2f9 100644
  /*
   * This properties are set based on the received platform data and this
   * should correspond one-to-one with enum chan_type.
-@@ -98,6 +119,23 @@ static int gab_read_channel(struct gab *adc_bat, enum gab_chan_type channel,
+@@ -98,6 +126,30 @@ static int gab_read_channel(struct gab *adc_bat, enum gab_chan_type channel,
  	return ret;
  }
  
@@ -1516,9 +1524,16 @@ index f5f2566b3..978adc2f9 100644
 +{
 +	int ret, ocv_uv;
 +
-+	ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &ocv_uv);
-+	if (ret < 0)
-+		return ret;
++	/* Use the EMA-smoothed voltage when available so the reported level
++	 * does not jump around with load; fall back to a direct read before
++	 * the first poll has run. */
++	if (adc_bat->voltage_valid)
++		ocv_uv = adc_bat->avg_voltage_uv;
++	else {
++		ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &ocv_uv);
++		if (ret < 0)
++			return ret;
++	}
 +
 +	ret = power_supply_batinfo_ocv2cap(adc_bat->info, ocv_uv,
 +					   GAB_DEFAULT_TEMP_C);
@@ -1532,7 +1547,7 @@ index f5f2566b3..978adc2f9 100644
  static int gab_get_property(struct power_supply *psy,
  		enum power_supply_property psp, union power_supply_propval *val)
  {
-@@ -107,6 +145,33 @@ static int gab_get_property(struct power_supply *psy,
+@@ -107,7 +159,38 @@ static int gab_get_property(struct power_supply *psy,
  	case POWER_SUPPLY_PROP_STATUS:
  		val->intval = adc_bat->status;
  		return 0;
@@ -1564,13 +1579,48 @@ index f5f2566b3..978adc2f9 100644
 +		val->intval = adc_bat->info->voltage_max_design_uv;
 +		return 0;
  	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		if (adc_bat->voltage_valid) {
++			val->intval = adc_bat->avg_voltage_uv;
++			return 0;
++		}
  		return gab_read_channel(adc_bat, GAB_VOLTAGE, &val->intval);
  	case POWER_SUPPLY_PROP_CURRENT_NOW:
-@@ -130,7 +195,12 @@ static void gab_work(struct work_struct *work)
+ 		return gab_read_channel(adc_bat, GAB_CURRENT, &val->intval);
+@@ -124,21 +207,53 @@ static void gab_work(struct work_struct *work)
+ {
+ 	struct gab *adc_bat;
+ 	struct delayed_work *delayed_work;
+-	int status;
++	int status, old_capacity, voltage_uv, ret;
+ 
+ 	delayed_work = to_delayed_work(work);
  	adc_bat = container_of(delayed_work, struct gab, bat_work);
  	status = adc_bat->status;
++	old_capacity = adc_bat->capacity;
  
 -	if (!power_supply_am_i_supplied(adc_bat->psy))
++	/*
++	 * Sample the battery voltage and smooth it with an EMA so the level
++	 * does not jump around with CPU/GPU load (VBAT sags under load).
++	 */
++	ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &voltage_uv);
++	if (!ret) {
++		if (adc_bat->voltage_valid)
++			adc_bat->avg_voltage_uv = (adc_bat->avg_voltage_uv * 3 +
++						   voltage_uv) / 4;
++		else
++			adc_bat->avg_voltage_uv = voltage_uv;
++		adc_bat->voltage_valid = true;
++
++		if (adc_bat->info) {
++			ret = power_supply_batinfo_ocv2cap(adc_bat->info,
++							   adc_bat->avg_voltage_uv,
++							   GAB_DEFAULT_TEMP_C);
++			if (ret >= 0)
++				adc_bat->capacity = ret;
++		}
++	}
++
 +	/*
 +	 * power_supply_am_i_supplied() returns -ENODEV when there is no
 +	 * charger power-supply at all, which must not be mistaken for
@@ -1580,7 +1630,20 @@ index f5f2566b3..978adc2f9 100644
  		adc_bat->status =  POWER_SUPPLY_STATUS_DISCHARGING;
  	else if (gab_charge_finished(adc_bat))
  		adc_bat->status = POWER_SUPPLY_STATUS_NOT_CHARGING;
-@@ -151,6 +221,27 @@ static irqreturn_t gab_charged(int irq, void *dev_id)
+ 	else
+ 		adc_bat->status = POWER_SUPPLY_STATUS_CHARGING;
+ 
+-	if (status != adc_bat->status)
++	if (status != adc_bat->status || old_capacity != adc_bat->capacity)
+ 		power_supply_changed(adc_bat->psy);
++
++	/* Re-arm the periodic poll. */
++	schedule_delayed_work(&adc_bat->bat_work,
++			      msecs_to_jiffies(GAB_POLL_INTERVAL_MS));
+ }
+ 
+ static irqreturn_t gab_charged(int irq, void *dev_id)
+@@ -151,6 +266,27 @@ static irqreturn_t gab_charged(int irq, void *dev_id)
  	return IRQ_HANDLED;
  }
  
@@ -1608,7 +1671,7 @@ index f5f2566b3..978adc2f9 100644
  static int gab_probe(struct platform_device *pdev)
  {
  	struct gab *adc_bat;
-@@ -161,6 +252,7 @@ static int gab_probe(struct platform_device *pdev)
+@@ -161,6 +297,7 @@ static int gab_probe(struct platform_device *pdev)
  	int chan;
  	int index = ARRAY_SIZE(gab_props);
  	bool any = false;
@@ -1616,7 +1679,7 @@ index f5f2566b3..978adc2f9 100644
  
  	adc_bat = devm_kzalloc(&pdev->dev, sizeof(*adc_bat), GFP_KERNEL);
  	if (!adc_bat)
-@@ -183,7 +275,8 @@ static int gab_probe(struct platform_device *pdev)
+@@ -183,7 +320,8 @@ static int gab_probe(struct platform_device *pdev)
  	 */
  	properties = devm_kcalloc(&pdev->dev,
  				  ARRAY_SIZE(gab_props) +
@@ -1626,7 +1689,7 @@ index f5f2566b3..978adc2f9 100644
  				  sizeof(*properties),
  				  GFP_KERNEL);
  	if (!properties)
-@@ -220,6 +313,17 @@ static int gab_probe(struct platform_device *pdev)
+@@ -220,6 +358,17 @@ static int gab_probe(struct platform_device *pdev)
  	if (!any)
  		return dev_err_probe(&pdev->dev, -ENODEV, "Failed to get any ADC channel\n");
  
@@ -1644,7 +1707,7 @@ index f5f2566b3..978adc2f9 100644
  	/*
  	 * Total number of properties is equal to static properties
  	 * plus the dynamic properties.Some properties may not be set
-@@ -233,6 +337,12 @@ static int gab_probe(struct platform_device *pdev)
+@@ -233,6 +382,12 @@ static int gab_probe(struct platform_device *pdev)
  	if (IS_ERR(adc_bat->psy))
  		return dev_err_probe(&pdev->dev, PTR_ERR(adc_bat->psy), "Failed to register power-supply device\n");
  
