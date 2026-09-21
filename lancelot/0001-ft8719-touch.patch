@@ -1,3 +1,94 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6768.dtsi b/arch/arm64/boot/dts/mediatek/mt6768.dtsi
+index 55963efd7..c21ee36ca 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6768.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6768.dtsi
+@@ -303,7 +303,7 @@ cpu0: cpu@0 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -325,7 +325,7 @@ cpu1: cpu@100 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -347,7 +347,7 @@ cpu2: cpu@200 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -369,7 +369,7 @@ cpu3: cpu@300 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -391,7 +391,7 @@ cpu4: cpu@400 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -413,7 +413,7 @@ cpu5: cpu@500 {
+ 			operating-points-v2 = <&cluster0_opp>;
+ 			dynamic-power-coefficient = <85>;
+ 			capacity-dmips-mhz = <495>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <32768>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -435,7 +435,7 @@ cpu6: cpu@600 {
+ 			operating-points-v2 = <&cluster1_opp>;
+ 			dynamic-power-coefficient = <275>;
+ 			capacity-dmips-mhz = <1024>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <65536>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -457,7 +457,7 @@ cpu7: cpu@700 {
+ 			operating-points-v2 = <&cluster1_opp>;
+ 			dynamic-power-coefficient = <275>;
+ 			capacity-dmips-mhz = <1024>;
+-			cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
++			cpu-idle-states = <&CPU_SLEEP>;
+ 			i-cache-size = <65536>;
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+@@ -538,6 +538,14 @@ CPU_SLEEP: cpu-sleep {
+ 				min-residency-us = <1200>;
+ 			};
+ 
++			/*
++			 * CLUSTER_SLEEP is intentionally NOT referenced by any CPU's
++			 * cpu-idle-states: the cluster power-down sequence (PSCI
++			 * param 0x01010001) does not wake back up on the Redmi 9 /
++			 * MT6768 with mainline, so the device hangs ~45-60s after
++			 * boot once it is actually used (masked before by the PMIC
++			 * IRQ storm keeping the CPU busy). See HANDOFF.md §6b.
++			 */
+ 			CLUSTER_SLEEP: cluster-sleep {
+ 				compatible = "arm,idle-state";
+ 				local-timer-stop;
 diff --git a/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi b/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
 index d75af26e0..91085166f 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
