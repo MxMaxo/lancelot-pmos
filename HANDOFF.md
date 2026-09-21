@@ -112,63 +112,65 @@ python3 avbtool.py add_hash_footer --image flash/boot_touch.img \
 
 **Прошивка (ОБЯЗАТЕЛЬНО через oflag=direct — иначе page-cache не сбросится!):**
 
+⚠️ **СНАЧАЛА определи, как зовётся eMMC!** Нумерация НЕСТАБИЛЬНА: в прошлой
+сессии eMMC был `mmcblk1`, сейчас `mmcblk0`. Перед прошивкой проверь:
+```bash
+$SSH 'lsblk | grep -E "mmcblk[01] " ; ls -la /dev/mmcblk1* 2>/dev/null'
+```
+Boot-раздел — это тот, где rootfs `...p44` смонтирован как `/` (см. `mount`).
+`boot` = тот же mmcblkX, раздел **p34** (64 МБ). Если rootfs на `mmcblk0p44`,
+то boot = **mmcblk0p34** (НЕ слепо mmcblk1p34!).
+
 ```bash
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/phone maxi@172.16.42.1"
 scp -i ~/.ssh/phone flash/boot_touch.img maxi@172.16.42.1:/tmp/
-$SSH 'sudo dd if=/tmp/boot_touch.img of=/dev/mmcblk1p34 bs=4096 oflag=direct conv=fsync; sudo systemctl reboot'
+# BOOT=... определи как выше (пример для mmcblk0):
+$SSH 'sudo dd if=/tmp/boot_touch.img of=/dev/mmcblk0p34 bs=4096 oflag=direct conv=fsync; sudo systemctl reboot'
 ```
 
-Проверка записи (минуя кеш): `$SSH 'sudo dd if=/dev/mmcblk1p34 iflag=direct bs=4096 count=16384 2>/dev/null | md5sum'`
+Проверка записи (минуя кеш): `$SSH 'sudo dd if=/dev/mmcblk0p34 iflag=direct bs=4096 count=16384 2>/dev/null | md5sum'`
+Сравни с локальным `md5sum flash/boot_touch.img`.
 
 SSH-ключ: `~/.ssh/phone` (ed25519), логин `maxi`, пароль `pmos`, passwordless sudo.
 
 ---
 
-## 6. PMIC IRQ-шторм — НАСТОЯЩАЯ ПРИЧИНА НАЙДЕНА (фикс в r17, проверяй)
+## 6. PMIC IRQ-шторм — РЕШЁН (фикс в r18, ПРОВЕРЕН на железе)
 
 **Симптом:** `mt6358-irq` (IRQ 172 / EINT 144) генерирует ~25–39K прерываний/сек
 → 14–22% CPU и **случайные зависания/перезагрузки**.
 
-**Разбор hataketsu (файлы скачаны в `lancelot/hataketsu_patches/`):**
-- `pmic-irq-storm.diff` (5988 Б) = это ТО ЖЕ САМОЕ, что 0001+0002 вместе
-  (XPP-offset fix + маскировка unserviced групп + disable unclaimed). Уже было
-  в патче r15/r16. Нового там нет.
-- **`PMIC-IRQ-STORM.vi.md` (вьетнамский) — вот ключ.** Итог его измерений на
-  железе:
-  1. Найден и исправлен РЕАЛЬНЫЙ баг mainline: в `mt6358/core.h` пропущена группа
-     `XPP` (bit 6), из-за чего AUD/MISC сдвинуты на 1 бит. Это НЕ причина шторма,
-     но баг настоящий (подтверждён железом: `TOP_INT_MASK_CON0 = 0x0040`).
-  2. **PMIC полностью невиновен**: все `TOP_INT_STATUS0/RAW/INT_STA = 0x0000`,
-     32 последовательных чтения — ни одного бита. PMIC не тянет линию.
-  3. Настоящая причина — **полярность выхода прерывания PMIC**. Регистр
-     `RG_INT_POLARITY` = `MT6358_TOP_INT_CON0` @ `0x1a2` bit0. На lancelot он = 0
-     (active-LOW), а SoC ждёт `IRQ_TYPE_LEVEL_HIGH`. Линия «покоится» в HIGH →
-     вечный шторм. Ни один downstream-драйвер этот регистр не пишет (0 — либо
-     reset-default, либо ставит LK; mainline-u-boot отличается от Android LK).
-  4. EINT-сторона SoC исключена: `EINT_SOFT bit16=0` (не софт-прерывание от
-     бутлоадера), `EINT_POL bit16=1` (active-high — правильно), все board в
-     mainline используют LEVEL_HIGH.
+**Разбор hataketsu (файлы в `lancelot/hataketsu_patches/`):**
+- `pmic-irq-storm.diff` = 0001+0002 вместе (XPP-offset fix + маскировка). Уже было.
+- `PMIC-IRQ-STORM.vi.md` (вьетнамский) — там настоящее расследование. Ключевые
+  факты, подтверждённые им И мной на железе:
+  1. Реальный баг mainline: в `mt6358/core.h` пропущена группа `XPP` (bit 6) →
+     AUD/MISC сдвинуты на 1 бит. Это НЕ причина шторма, но баг настоящий
+     (подтверждено железом: `TOP_INT_MASK_CON0 = 0x0040`). Оставлен в патче.
+  2. **PMIC полностью невиновен**: все `TOP_INT_STATUS0/RAW/INT_STA = 0x0000`.
+  3. Настоящая причина — **полярность линии EINT144**. Линия физически ПОКОИТСЯ
+     В HIGH (PMIC работает active-low / open-drain), а DTS задавал
+     `IRQ_TYPE_LEVEL_HIGH`. SoC видел HIGH = «активно» → вечный шторм.
 
-**ФИКС (реализован в r17, ЕЩЁ НЕ ПРОВЕРЕН на железе):**
-в `drivers/mfd/mt6358-irq.c` → `mt6358_irq_init()`, до `request_threaded_irq`:
-```c
-if (chip->chip_id == MT6358_CHIP_ID || chip->chip_id == MT6366_CHIP_ID)
-    regmap_update_bits(chip->regmap, MT6358_TOP_INT_CON0, 0x1, 0x1);
+**ЧТО ПРОВЕРЕНО (мои измерения на железе):**
+- Гипотеза «RG_INT_POLARITY (0x1a2 bit0)» — **ОПРОВЕРГНУТА**. Записал 0→1
+  (r17), шторм остался ~27K/с. Бит пишется, но уровень линии не меняет.
+- Решающий тест: переключил EINT144 в active-low (`pol_clr`, POL bit16=0) прямо
+  в рантайме через /dev/mem → **шторм упал в 0/с мгновенно**. Вернул active-high
+  → шторм вернулся. Однозначно: линия в HIGH, нужен active-low.
+- `mtk-eint.c`: `IRQ_TYPE_LEVEL_LOW → pol_clr` (ровно то, что делал вручную).
+
+**ФИКС (r18):** в `arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi`:
 ```
-плюс `#define MT6358_TOP_INT_CON0 0x1a2` в `include/linux/mfd/mt6358/registers.h`.
+&pmic {
+-	interrupts-extended = <&pio 144 IRQ_TYPE_LEVEL_HIGH>;
++	interrupts-extended = <&pio 144 IRQ_TYPE_LEVEL_LOW>;
+};
+```
+Проверка: `cat /proc/interrupts | grep mt6358-irq` → счётчик ~единицы/с (не 25K).
 
-**Проверка после прошивки r17:** `cat /proc/interrupts | grep mt6358-irq` —
-счётчик должен перестать расти (~единицы/с), `irq/172-mt6358-irq` в top ≈ 0%.
-
-**План Б, если фикс не сработал** (модуль-диагностика, как у hataketsu §6.2):
-собрать `mt6358_eintpol.ko` с режимами:
-- `mode=1` — перевести EINT144 в active-low на стороне SoC (`pol_clr`): если
-  счётчик встал → линия реально на HIGH (проблема полярности, подтверждает §6).
-- `mode=3` — писать `RG_INT_POLARITY=1` (то же, что делает фикс, но в рантайме
-  для проверки без пересборки ядра).
-
-Полный разбор: `lancelot/hataketsu_patches/PMIC-IRQ-STORM.vi.md` (переводится
-Google Translate, вьетнамский).
+**Почему не `RG_INT_POLARITY`**: она не влияет на уровень покоя линии (вероятно
+open-drain + внешний pull-up). DTS-фикс — правильный и минимальный.
 
 ---
 
@@ -182,8 +184,8 @@ Google Translate, вьетнамский).
 
 ## 8. Следующие шаги (приоритет)
 
-1. **Проверить фикс PMIC IRQ-шторма (r17)** — прошить и убедиться, что IRQ 172
-   больше не растёт (см. §6). Это главное, иначе случайные ребуты.
+1. **Проверить фикс PMIC IRQ-шторма (r18)** — УЖЕ СДЕЛАНО и проверено: IRQ 172 = 0/с.
+   Дальше по приоритету:
 2. **Батарея/зарядка** — патчи `hataketsu/mt6768-mainline-notes` →
    `kernel-patches/battery/*.patch` + драйвер SMB1351 (его нет в mainline).
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже
@@ -200,7 +202,9 @@ Google Translate, вьетнамский).
 4. `CONFIG_INPUT_EVDEV=y` — иначе нет /dev/input/eventX (evdev=m падает из-за BTF).
 5. `CONFIG_MODULE_ALLOW_BTF_MISMATCH=y` — иначе модули падают `BTF: -22`.
 6. **`dd` в eMMC — `oflag=direct`**, иначе page-cache не сбрасывается до reboot.
-7. Нумерация разделов: в pmOS eMMC = mmcblk1 (не mmcblk0).
+7. **Нумерация разделов НЕСТАБИЛЬНА**: eMMC бывает и `mmcblk0`, и `mmcblk1`
+   (зависит от наличия SD-карты/порядка probe). ВСЕГДА проверяй `lsblk` + `mount`
+   перед прошивкой boot (см. §5). В прошлой сессии был mmcblk1, сейчас mmcblk0.
 8. Прошивка тача запрашивается ДО монтирования rootfs → нужен ретрай в драйвере
    (уже есть) + файл в /lib/firmware.
 9. CRC в SPI FT8719 — только когда послан command-package; при чтении touch-данных
