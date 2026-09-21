@@ -1,0 +1,29 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 4/5] power: supply: generic-adc-battery: Do not report charging without a charger
+
+power_supply_am_i_supplied() returns a negative errno, -ENODEV, when
+no charger power-supply is registered at all. The negative value is
+not zero, so the driver takes it as "supplied" and permanently reports
+POWER_SUPPLY_STATUS_CHARGING on systems where the battery is the only
+power-supply device.
+
+Treat any non-positive return value as not supplied.
+---
+ drivers/power/supply/generic-adc-battery.c
+
+--- a/drivers/power/supply/generic-adc-battery.c
++++ b/drivers/power/supply/generic-adc-battery.c
+@@ -130,7 +130,12 @@
+ 	adc_bat = container_of(delayed_work, struct gab, bat_work);
+ 	status = adc_bat->status;
+ 
+-	if (!power_supply_am_i_supplied(adc_bat->psy))
++	/*
++	 * power_supply_am_i_supplied() returns -ENODEV when there is no
++	 * charger power-supply at all, which must not be mistaken for
++	 * "supplied": without a charger to ask, the battery is discharging.
++	 */
++	if (power_supply_am_i_supplied(adc_bat->psy) <= 0)
+ 		adc_bat->status =  POWER_SUPPLY_STATUS_DISCHARGING;
+ 	else if (gab_charge_finished(adc_bat))
+ 		adc_bat->status = POWER_SUPPLY_STATUS_NOT_CHARGING;

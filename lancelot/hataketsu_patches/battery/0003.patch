@@ -1,0 +1,27 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 3/5] iio: adc: mt6359-auxadc: Fix the MT6358 VBAT resistor ratio
+
+The MT6358 VBAT channel is declared with a 7/2 input divider ratio,
+which is the MT6359 value. The MediaTek vendor code converts the
+MT6358 (and MT6357) impedance VBAT reading as
+
+  *bat = (vbat_reg * 3 * 18000) / 32768;
+
+i.e. a ratio of 3/1, same as the already correct MT6357 entry.
+
+With 7/2 a battery sitting at 3.9 V is reported as 4.56 V, above the
+charger constant voltage, which is impossible.
+---
+ drivers/iio/adc/mt6359-auxadc.c
+
+--- a/drivers/iio/adc/mt6359-auxadc.c
++++ b/drivers/iio/adc/mt6359-auxadc.c
+@@ -286,7 +286,7 @@
+ 	MTK_PMIC_ADC_CHAN(VGPU_TEMP, PMIC_AUXADC_RQST1, 10, PMIC_AUXADC_IMP0, 8, 8, 1, 1),
+ 
+ 	/* Battery impedance channels */
+-	MTK_PMIC_ADC_CHAN(VBAT, 0, 0, PMIC_AUXADC_IMP0, 8, 128, 7, 2),
++	MTK_PMIC_ADC_CHAN(VBAT, 0, 0, PMIC_AUXADC_IMP0, 8, 128, 3, 1),
+ };
+ 
+ static const u16 mt6358_auxadc_regs[] = {

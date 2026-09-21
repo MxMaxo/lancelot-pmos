@@ -1,0 +1,203 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 5/5] power: supply: generic-adc-battery: Report capacity from the OCV table
+
+The adc-battery binding requires a monitored-battery phandle, but the
+driver never looked at it, so it could not report POWER_SUPPLY_PROP_CAPACITY
+and userspace (UPower and friends) had no charge level to display.
+
+When the referenced battery node provides an ocv-capacity-table-0,
+register the battery info and expose CAPACITY, PRESENT, TECHNOLOGY,
+CHARGE_FULL_DESIGN and VOLTAGE_{MIN,MAX}_DESIGN. Capacity is derived
+from the measured voltage with power_supply_batinfo_ocv2cap().
+
+The presence of the table has to be checked before registering the
+power-supply, because the property array must be final by then, while
+power_supply_get_battery_info() needs the registered device. The
+property handlers therefore tolerate info being NULL, which can happen
+for the uevent emitted by power_supply_register() itself.
+---
+ drivers/power/supply/generic-adc-battery.c
+
+--- a/drivers/power/supply/generic-adc-battery.c
++++ b/drivers/power/supply/generic-adc-battery.c
+@@ -18,10 +18,17 @@
+ #include <linux/iio/consumer.h>
+ #include <linux/iio/types.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ #include <linux/devm-helpers.h>
+ 
+ #define JITTER_DEFAULT 10 /* hope 10ms is enough */
+ 
++/*
++ * Temperature (degrees C) used to pick the OCV -> capacity table when no
++ * usable battery temperature channel is wired up.
++ */
++#define GAB_DEFAULT_TEMP_C 25
++
+ enum gab_chan_type {
+ 	GAB_VOLTAGE = 0,
+ 	GAB_CURRENT,
+@@ -48,6 +55,7 @@
+ 	struct delayed_work bat_work;
+ 	int status;
+ 	struct gpio_desc *charge_finished;
++	struct power_supply_battery_info *info;
+ };
+ 
+ static struct gab *to_generic_bat(struct power_supply *psy)
+@@ -67,6 +75,19 @@
+ };
+ 
+ /*
++ * Extra properties which can only be provided when a "monitored-battery"
++ * with an OCV -> capacity table is described in the device tree.
++ */
++static const enum power_supply_property gab_batinfo_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++};
++
++/*
+  * This properties are set based on the received platform data and this
+  * should correspond one-to-one with enum chan_type.
+  */
+@@ -98,6 +119,23 @@
+ 	return ret;
+ }
+ 
++static int gab_get_capacity(struct gab *adc_bat, int *result)
++{
++	int ret, ocv_uv;
++
++	ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &ocv_uv);
++	if (ret < 0)
++		return ret;
++
++	ret = power_supply_batinfo_ocv2cap(adc_bat->info, ocv_uv,
++					   GAB_DEFAULT_TEMP_C);
++	if (ret < 0)
++		return ret;
++
++	*result = ret;
++	return 0;
++}
++
+ static int gab_get_property(struct power_supply *psy,
+ 		enum power_supply_property psp, union power_supply_propval *val)
+ {
+@@ -107,6 +145,33 @@
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		val->intval = adc_bat->status;
+ 		return 0;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		if (!adc_bat->info)
++			return -EAGAIN;
++		val->intval = adc_bat->info->technology;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		if (!adc_bat->info)
++			return -EAGAIN;
++		return gab_get_capacity(adc_bat, &val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		if (!adc_bat->info)
++			return -EAGAIN;
++		val->intval = adc_bat->info->charge_full_design_uah;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		if (!adc_bat->info)
++			return -EAGAIN;
++		val->intval = adc_bat->info->voltage_min_design_uv;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		if (!adc_bat->info)
++			return -EAGAIN;
++		val->intval = adc_bat->info->voltage_max_design_uv;
++		return 0;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 		return gab_read_channel(adc_bat, GAB_VOLTAGE, &val->intval);
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+@@ -156,6 +221,27 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * Check whether the "monitored-battery" phandle points at a battery node
++ * which carries an OCV -> capacity table. This has to be known before the
++ * power-supply device is registered, while power_supply_get_battery_info()
++ * can only be called afterwards.
++ */
++static bool gab_has_ocv_table(struct device *dev)
++{
++	struct fwnode_handle *fwnode;
++	bool present;
++
++	fwnode = fwnode_find_reference(dev_fwnode(dev), "monitored-battery", 0);
++	if (IS_ERR(fwnode))
++		return false;
++
++	present = fwnode_property_present(fwnode, "ocv-capacity-table-0");
++	fwnode_handle_put(fwnode);
++
++	return present;
++}
++
+ static int gab_probe(struct platform_device *pdev)
+ {
+ 	struct gab *adc_bat;
+@@ -166,6 +252,7 @@
+ 	int chan;
+ 	int index = ARRAY_SIZE(gab_props);
+ 	bool any = false;
++	bool use_batinfo;
+ 
+ 	adc_bat = devm_kzalloc(&pdev->dev, sizeof(*adc_bat), GFP_KERNEL);
+ 	if (!adc_bat)
+@@ -188,7 +275,8 @@
+ 	 */
+ 	properties = devm_kcalloc(&pdev->dev,
+ 				  ARRAY_SIZE(gab_props) +
+-				  ARRAY_SIZE(gab_chan_name),
++				  ARRAY_SIZE(gab_chan_name) +
++				  ARRAY_SIZE(gab_batinfo_props),
+ 				  sizeof(*properties),
+ 				  GFP_KERNEL);
+ 	if (!properties)
+@@ -226,6 +314,17 @@
+ 		return dev_err_probe(&pdev->dev, -ENODEV, "Failed to get any ADC channel\n");
+ 
+ 	/*
++	 * A voltage channel plus an OCV table is enough to report a (rough)
++	 * charge level, which is what userspace (UPower et al) actually needs.
++	 */
++	use_batinfo = adc_bat->channel[GAB_VOLTAGE] && gab_has_ocv_table(&pdev->dev);
++	if (use_batinfo) {
++		memcpy(&properties[index], gab_batinfo_props,
++		       sizeof(gab_batinfo_props));
++		index += ARRAY_SIZE(gab_batinfo_props);
++	}
++
++	/*
+ 	 * Total number of properties is equal to static properties
+ 	 * plus the dynamic properties.Some properties may not be set
+ 	 * as come channels may be not be supported by the device.So
+@@ -238,6 +337,12 @@
+ 	if (IS_ERR(adc_bat->psy))
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(adc_bat->psy), "Failed to register power-supply device\n");
+ 
++	if (use_batinfo) {
++		ret = power_supply_get_battery_info(adc_bat->psy, &adc_bat->info);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret, "Failed to get battery info\n");
++	}
++
+ 	ret = devm_delayed_work_autocancel(&pdev->dev, &adc_bat->bat_work, gab_work);
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to register delayed work\n");

@@ -16,8 +16,9 @@ Helio G80 / **MT6769T**). ВАЖНО: аппарат — ревизия **Huaxin
 - ✅ Тач Focaltech FT8719, 10 пальцев (портированный драйвер)
 - ✅ GPU panfrost (Mali-G52), Plasma Mobile (systemd), SSH по USB (172.16.42.1)
 - ✅ eMMC (4 ГБ RAM, карвеауты LK в порядке)
+- ✅ Батарея (fuel gauge): % заряда по VBAT + OCV-таблица (adc-battery)
 
-**НЕ работает:** батарея/зарядка (SMB1351), Wi-Fi/BT (gen4m), аудио (mt6358).
+**НЕ работает:** зарядка (SMB1351 — нет драйвера), Wi-Fi/BT (gen4m), аудио (mt6358).
 
 ---
 
@@ -212,10 +213,11 @@ mainline не просыпается → CPU-кластер зависает. GP
 
 ## 8. Следующие шаги (приоритет)
 
-1. **Проверить r20** (LEVEL_LOW + без cluster-sleep): стабильно 10+ мин без ребутов,
-   IRQ 172 = 0/с. Оба бага (шторм + зависание) закрыты в патче.
-2. **Батарея/зарядка** — патчи `hataketsu/mt6768-mainline-notes` →
-   `kernel-patches/battery/*.patch` + драйвер SMB1351 (его нет в mainline).
+1. **Проверить r21** (LEVEL_LOW + без cluster-sleep + батарея): стабильно 10+ мин,
+   IRQ 172 = 0/с, `cat /sys/class/power_supply/fuel-gauge/capacity` → % заряда.
+2. **Зарядка (SMB1351)** — нужен порт драйвера SMB1351 (его нет в mainline), чтобы
+   реально заряжать. Fuel gauge (проценты) уже работает от VBAT. См. патчи
+   `hataketsu/mt6768-mainline-notes` → `kernel-patches/battery/*.patch` (применены).
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже
    извлечены в `lancelot/extracted/firmware/` (WIFI_RAM_CODE_soc1_0_1a_1.bin и др.).
 4. **Аудио** — mt6358 DAI-обвязка.

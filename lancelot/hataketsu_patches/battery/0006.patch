@@ -1,0 +1,65 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 6/5] arm64: dts: mediatek: Add battery and fuel gauge to Xiaomi Redmi 9
+
+Estimate the charge level from the MT6358 AUXADC VBAT channel. There
+is no mainline driver for the PMIC coulomb counter or for the SMB1351
+charger, so this is voltage based only.
+
+The OCV table is derived from the 25 degrees Celsius fuel gauge
+profile of the vendor kernel, rescaled so that the 3.4 V system
+cut-off is 0%.
+---
+ arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
+
+--- a/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
+@@ -7,6 +7,7 @@
+ 
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/leds/common.h>
++#include <dt-bindings/iio/adc/mediatek,mt6358-auxadc.h>
+ #include <dt-bindings/iio/adc/mediatek,mt6370_adc.h>
+ #include <dt-bindings/usb/pd.h>
+ #include "mt6769t.dtsi"
+@@ -37,6 +38,41 @@
+ 		};
+ 	};
+ 
++	/*
++	 * 5020 mAh 4.4 V Li-ion pack. The OCV table is derived from the
++	 * 25 degC fuel gauge profile of the downstream MT6768 kernel
++	 * (mtk_battery_table.h, fg_profile_t1), rescaled so that the
++	 * 3.4 V system cut-off voltage is 0%.
++	 */
++	battery: battery {
++		compatible = "simple-battery";
++		device-chemistry = "lithium-ion";
++		charge-full-design-microamp-hours = <5020000>;
++		voltage-min-design-microvolt = <3400000>;
++		voltage-max-design-microvolt = <4400000>;
++		constant-charge-voltage-max-microvolt = <4396000>;
++		constant-charge-current-max-microamp = <2050000>;
++		ocv-capacity-celsius = <25>;
++		ocv-capacity-table-0 =
++			<4320000 100>, <4263000 95>, <4210000 90>, <4157000 85>,
++			<4105000 80>, <4065000 75>, <4004000 70>, <3972000 65>,
++			<3920000 60>, <3878000 55>, <3850000 50>, <3830000 45>,
++			<3812000 40>, <3797000 35>, <3780000 30>, <3760000 25>,
++			<3743000 20>, <3715000 15>, <3695000 10>, <3660000 7>,
++			<3600000 5>, <3520000 3>, <3450000 1>, <3400000 0>;
++	};
++
++	/*
++	 * There is no mainline driver for the MT6358 coulomb counter or for
++	 * the SMB1351 charger, so battery level is estimated from the PMIC
++	 * AUXADC VBAT channel using the OCV table above.
++	 */
++	fuel-gauge {
++		compatible = "adc-battery";
++		io-channels = <&pmic_adc MT6358_AUXADC_VBAT>;
++		io-channel-names = "voltage";
++		monitored-battery = <&battery>;
++	};
+ };
+ 
+ &auxadc {

@@ -1,0 +1,47 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 2/5] iio: adc: mt6359-auxadc: Take the ADC resolution into account in the scale
+
+The scale currently only carries the reference voltage and the input
+resistor divider ratio, so in_voltageY_raw * in_voltageY_scale is off
+by 2^realbits, i.e. 4096 or 32768 times too large.
+
+The vendor driver computes the value as
+
+  val * r_ratio[0] * VOLT_FULL / r_ratio[1] >> res
+
+so the resolution has to be part of the scale. Fold it into the
+fractional denominator, which also makes the returned scale always
+fractional.
+
+The IIO core does not use scan_type.realbits when converting raw
+values with iio_convert_raw_to_processed(), so consumers had no way to
+correct this on their own.
+---
+ drivers/iio/adc/mt6359-auxadc.c
+
+--- a/drivers/iio/adc/mt6359-auxadc.c
++++ b/drivers/iio/adc/mt6359-auxadc.c
+@@ -774,14 +774,17 @@
+ 	int ret;
+ 
+ 	if (mask == IIO_CHAN_INFO_SCALE) {
++		/*
++		 * The raw value is the full resolution conversion result, so
++		 * the scale has to account for the ADC resolution as well:
++		 *   value = raw * vref * r_num / (r_div * 2^realbits)
++		 * Without the 2^realbits divisor, raw * scale overshoots the
++		 * real value by three to four orders of magnitude.
++		 */
+ 		*val = desc->r_ratio.numerator * cinfo->vref_mV;
++		*val2 = desc->r_ratio.denominator << chan->scan_type.realbits;
+ 
+-		if (desc->r_ratio.denominator > 1) {
+-			*val2 = desc->r_ratio.denominator;
+-			return IIO_VAL_FRACTIONAL;
+-		}
+-
+-		return IIO_VAL_INT;
++		return IIO_VAL_FRACTIONAL;
+ 	}
+ 
+ 	scoped_guard(mutex, &adc_dev->lock) {

@@ -1,0 +1,35 @@
+From: Redmi 9 mainline port <lancelot@example.invalid>
+Subject: [PATCH 1/5] iio: adc: mt6359-auxadc: Mask out the data ready bit of the IMP channel
+
+mt6358_read_imp() hands the raw content of the AUXADC_ADC28 register
+back to the IIO core. Bit 15 of that register is the ADC data ready
+flag (AUXADC_ADC_RDY_IMP), not part of the conversion result, and it
+is still set when the value is read.
+
+As a consequence the reported raw value can exceed the 15 bit channel
+resolution, e.g. 0xdca8 instead of 0x5ca8, making the computed voltage
+almost three times too high.
+
+The MediaTek vendor code masks the register with 0x7fff
+(PMIC_AUXADC_ADC_OUT_IMP_MASK) before using it; do the same, using the
+channel resolution just like mt6359_auxadc_read_adc() already does.
+---
+ drivers/iio/adc/mt6359-auxadc.c
+
+--- a/drivers/iio/adc/mt6359-auxadc.c
++++ b/drivers/iio/adc/mt6359-auxadc.c
+@@ -501,8 +501,13 @@
+ 
+ 	mt6358_stop_imp_conv(adc_dev);
+ 
++	/*
++	 * Bit 15 of the ADC output register is the data ready flag, which is
++	 * still set at this point: mask it out, otherwise the returned raw
++	 * value overflows the channel resolution.
++	 */
+ 	if (vbat)
+-		*vbat = val_v;
++		*vbat = val_v & GENMASK(chan->scan_type.realbits - 1, 0);
+ 	if (ibat)
+ 		*ibat = 0;
+ 
