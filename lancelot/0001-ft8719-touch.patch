@@ -90,7 +90,7 @@ index 55963efd7..c21ee36ca 100644
  				compatible = "arm,idle-state";
  				local-timer-stop;
 diff --git a/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi b/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
-index d75af26e0..fdc75695a 100644
+index d75af26e0..a02e4756f 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt6769t-xiaomi-common.dtsi
 @@ -7,6 +7,7 @@
@@ -144,12 +144,25 @@ index d75af26e0..fdc75695a 100644
  };
  
  &mt6358_vdram2_reg {
-@@ -44,7 +81,7 @@ &mt6358_vaux18_reg {
+@@ -44,7 +81,20 @@ &mt6358_vaux18_reg {
  };
  
  &pmic {
 -	interrupts-extended = <&pio 144 IRQ_TYPE_LEVEL_HIGH>;
 +	interrupts-extended = <&pio 144 IRQ_TYPE_LEVEL_LOW>;
++};
++
++&i2c7 {
++	status = "okay";
++
++	smb1351: charger@55 {
++		compatible = "qcom,smb1351";
++		reg = <0x55>;
++		interrupts-extended = <&pio 20 IRQ_TYPE_EDGE_FALLING>;
++		qcom,fast-charge-current-microamp = <1800000>;
++		qcom,float-voltage-microvolt = <4396000>;
++		qcom,termination-current-microamp = <200000>;
++	};
  };
  
  &cci {
@@ -1413,6 +1426,38 @@ index 9f0bcc3ad..3e071b782 100644
  	chip->irq_domain = irq_domain_create_linear(of_fwnode_handle(chip->dev->of_node),
  						    irqd->num_pmic_irqs,
  						    &mt6358_irq_domain_ops, chip);
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index 79ddb006e..9cd448758 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -810,6 +810,15 @@ config CHARGER_SMB347
+ 	  Say Y to include support for Summit Microelectronics SMB345,
+ 	  SMB347 or SMB358 Battery Charger.
+ 
++config CHARGER_SMB1351
++	tristate "Summit Microelectronics SMB1351 Battery Charger"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Say Y to include support for the Summit Microelectronics SMB1351
++	  standalone switching battery charger, as used on some MediaTek
++	  devices (e.g. Xiaomi Redmi 9 / Poco M2).
++
+ config CHARGER_TPS65090
+ 	tristate "TPS65090 battery charger driver"
+ 	depends on MFD_TPS65090
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 4f5f8e350..7bb042db0 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -102,6 +102,7 @@ obj-$(CONFIG_CHARGER_BQ25980)	+= bq25980_charger.o
+ obj-$(CONFIG_CHARGER_BQ256XX)	+= bq256xx_charger.o
+ obj-$(CONFIG_CHARGER_RK817)	+= rk817_charger.o
+ obj-$(CONFIG_CHARGER_SMB347)	+= smb347-charger.o
++obj-$(CONFIG_CHARGER_SMB1351)	+= smb1351-charger.o
+ obj-$(CONFIG_CHARGER_TPS65090)	+= tps65090-charger.o
+ obj-$(CONFIG_CHARGER_TPS65217)	+= tps65217_charger.o
+ obj-$(CONFIG_AXP288_FUEL_GAUGE) += axp288_fuel_gauge.o
 diff --git a/drivers/power/supply/generic-adc-battery.c b/drivers/power/supply/generic-adc-battery.c
 index f5f2566b3..978adc2f9 100644
 --- a/drivers/power/supply/generic-adc-battery.c
@@ -1612,6 +1657,463 @@ index f5f2566b3..978adc2f9 100644
  	ret = devm_delayed_work_autocancel(&pdev->dev, &adc_bat->bat_work, gab_work);
  	if (ret)
  		return dev_err_probe(&pdev->dev, ret, "Failed to register delayed work\n");
+diff --git a/drivers/power/supply/smb1351-charger.c b/drivers/power/supply/smb1351-charger.c
+new file mode 100644
+index 000000000..4c2ce6c55
+--- /dev/null
++++ b/drivers/power/supply/smb1351-charger.c
+@@ -0,0 +1,451 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * SMB1351 standalone switching battery charger driver
++ *
++ * Minimal mainline port for the Xiaomi Redmi 9 / Poco M2 (lancelot/shiva,
++ * MediaTek MT6768). The charger IC is a Summit/Qualcomm SMB1351 on I2C7 @ 0x55,
++ * wired to the SoC GPIO 20 (falling-edge interrupt).
++ *
++ * Derived from the downstream MediaTek/Qualcomm smb1351-charger.c.
++ * Implements the core charging path only: chip init, float voltage, fast-charge
++ * current, end-of-charge (termination) current, charging enable, and a
++ * power-supply class device so the generic-adc-battery fuel gauge sees the
++ * charger and reports "charging".
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++/* Register map (8-bit registers) */
++#define SMB1351_REG_CHG_CURRENT		0x00	/* fast-charge current */
++#define SMB1351_REG_CHG_OTHER_CURRENT	0x01	/* precharge current + input limit */
++#define SMB1351_REG_VARIOUS_FUNC	0x02
++#define SMB1351_REG_VFLOAT		0x03	/* float (CV) voltage */
++#define SMB1351_REG_CHG_CTRL		0x04
++#define SMB1351_REG_CHG_PIN_EN		0x06
++#define SMB1351_REG_THERM_A		0x07
++#define SMB1351_REG_VARIOUS_FUNC2	0x0e
++#define SMB1351_REG_FLEXCHARGER		0x10
++#define SMB1351_REG_OTG_POWER_OPTIONS	0x14
++#define SMB1351_REG_VERSION		0x2e
++#define SMB1351_REG_CMD_I2C		0x30
++#define SMB1351_REG_CMD_CHG		0x32
++#define SMB1351_REG_STATUS_1		0x37
++#define SMB1351_REG_STATUS_4		0x3a
++
++/* CHG_CURRENT (0x00) */
++#define FAST_CHG_CURRENT_MASK		GENMASK(7, 4)
++#define FAST_CHG_CURRENT_SHIFT		4
++/* CHG_OTHER_CURRENT (0x01) */
++#define PRECHG_CURRENT_MASK		GENMASK(7, 5)
++#define PRECHG_CURRENT_SHIFT		5
++/* VARIOUS_FUNC (0x02) */
++#define SUSPEND_MODE_CTRL_BIT		BIT(7)
++#define SUSPEND_MODE_CTRL_BY_I2C	BIT(7)
++#define AICL_EN_BIT			BIT(4)
++/* VFLOAT (0x03) */
++#define VFLOAT_MASK			GENMASK(5, 0)
++/* CHG_CTRL (0x04) */
++#define AUTO_RECHG_BIT			BIT(7)
++#define AUTO_RECHG_TH_BIT		BIT(3)
++/* CHG_PIN_EN (0x06) */
++#define EN_PIN_CTRL_MASK		GENMASK(6, 5)
++#define EN_BY_I2C			0x20
++#define USBCS_CTRL_BIT			BIT(4)
++#define USBCS_CTRL_BY_I2C		0
++#define CHG_ERR_BIT			BIT(2)
++#define APSD_DONE_BIT			BIT(1)
++#define LED_BLINK_FUNC_BIT		BIT(7)
++/* THERM_A (0x07) */
++#define MIN_SYS_VOLTAGE_MASK		GENMASK(7, 6)
++/* VARIOUS_FUNC2 (0x0e) */
++#define STAT_PIN_CONFIG_BIT		BIT(0)
++#define PRECHG_TO_FASTCHG_BIT		BIT(1)
++/* FLEXCHARGER (0x10) */
++#define CHG_CONFIG_MASK			GENMASK(6, 4)
++#define CHG_CONFIG			0x40
++/* OTG_MODE_POWER_OPTIONS (0x14) */
++#define ADAPTER_CONFIG_MASK		GENMASK(7, 6)
++/* CMD_I2C (0x30) */
++#define CMD_BQ_CFG_ACCESS_BIT		BIT(6)
++/* CMD_CHG (0x32) */
++#define CMD_CHG_EN_BIT			BIT(1)
++/* STATUS_1 (0x37) */
++#define STATUS_INPUT_USB_BIT		BIT(0)
++/* STATUS_4 (0x3a) */
++#define STATUS_CHG_MASK			GENMASK(2, 1)
++#define STATUS_NO_CHARGING		0
++#define STATUS_PRE_CHARGING		0x2
++#define STATUS_FAST_CHARGING		0x4
++#define STATUS_TAPER_CHARGING		0x6
++#define STATUS_DONE_BIT			BIT(5)
++
++/* Float voltage: 3.5 V .. 4.46 V in 20 mV steps */
++#define MIN_FLOAT_UV			3500000
++#define MAX_FLOAT_UV			4460000
++#define VFLOAT_STEP_UV			20000
++
++/* Fast-charge current lookup (mA), index into bits 4..7 */
++static const int smb1351_fast_chg_current[] = {
++	1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400,
++	2600, 2800, 3000, 3400, 3600, 3800, 4000, 4500,
++};
++
++/* Precharge current lookup (mA), index into bits 5..7 */
++static const int smb1351_pre_chg_current[] = {
++	100, 120, 200, 300, 400, 500, 600, 700,
++};
++
++static const struct regmap_config smb1351_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0x44,
++};
++
++struct smb1351 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct power_supply *psy;
++	struct gpio_desc *stat_gpio;
++	int irq;
++	struct delayed_work status_work;
++};
++
++static int smb1351_masked_write(struct smb1351 *chip, unsigned int reg,
++				unsigned int mask, unsigned int val)
++{
++	return regmap_update_bits(chip->regmap, reg, mask, val);
++}
++
++/* Many config registers live in a shadow bank; enable writes to it first. */
++static int smb1351_enable_volatile_writes(struct smb1351 *chip)
++{
++	return smb1351_masked_write(chip, SMB1351_REG_CMD_I2C,
++				    CMD_BQ_CFG_ACCESS_BIT, CMD_BQ_CFG_ACCESS_BIT);
++}
++
++static int smb1351_get_version(struct smb1351 *chip)
++{
++	unsigned int ver;
++	int ret;
++
++	ret = regmap_read(chip->regmap, SMB1351_REG_VERSION, &ver);
++	if (ret)
++		return ret;
++
++	dev_info(chip->dev, "SMB135%c detected\n", (ver & BIT(1)) ? '0' : '1');
++	return 0;
++}
++
++static int smb1351_set_float_voltage(struct smb1351 *chip, u32 uv)
++{
++	unsigned int reg;
++	int ret;
++
++	uv = clamp_val(uv, MIN_FLOAT_UV, MAX_FLOAT_UV);
++	reg = (uv - MIN_FLOAT_UV) / VFLOAT_STEP_UV;
++
++	ret = smb1351_enable_volatile_writes(chip);
++	if (ret)
++		return ret;
++
++	return smb1351_masked_write(chip, SMB1351_REG_VFLOAT, VFLOAT_MASK, reg);
++}
++
++static int smb1351_set_fastchg_current(struct smb1351 *chip, u32 ua)
++{
++	unsigned int ma = ua / 1000;
++	unsigned int reg = 0;
++	int i, ret;
++
++	for (i = ARRAY_SIZE(smb1351_fast_chg_current) - 1; i >= 0; i--)
++		if (smb1351_fast_chg_current[i] <= ma)
++			break;
++	if (i < 0)
++		i = 0;
++	reg = i << FAST_CHG_CURRENT_SHIFT;
++
++	ret = smb1351_enable_volatile_writes(chip);
++	if (ret)
++		return ret;
++
++	return smb1351_masked_write(chip, SMB1351_REG_CHG_CURRENT,
++				    FAST_CHG_CURRENT_MASK, reg);
++}
++
++static int smb1351_set_prechg_current(struct smb1351 *chip, u32 ua)
++{
++	unsigned int ma = ua / 1000;
++	unsigned int reg = 0;
++	int i, ret;
++
++	for (i = ARRAY_SIZE(smb1351_pre_chg_current) - 1; i >= 0; i--)
++		if (smb1351_pre_chg_current[i] <= ma)
++			break;
++	if (i < 0)
++		i = 0;
++	reg = i << PRECHG_CURRENT_SHIFT;
++
++	ret = smb1351_enable_volatile_writes(chip);
++	if (ret)
++		return ret;
++
++	return smb1351_masked_write(chip, SMB1351_REG_CHG_OTHER_CURRENT,
++				    PRECHG_CURRENT_MASK, reg);
++}
++
++static int smb1351_init_hw(struct smb1351 *chip)
++{
++	int ret;
++
++	ret = smb1351_get_version(chip);
++	if (ret)
++		return ret;
++
++	ret = smb1351_enable_volatile_writes(chip);
++	if (ret)
++		return ret;
++
++	/* Minimum system voltage 3.15 V (THERM_A, bits 7..6 = 0). */
++	ret = smb1351_masked_write(chip, SMB1351_REG_THERM_A,
++				   MIN_SYS_VOLTAGE_MASK, 0);
++	if (ret)
++		return ret;
++
++	/* Suspend mode controlled by I2C, AICL enabled. */
++	ret = smb1351_masked_write(chip, SMB1351_REG_VARIOUS_FUNC,
++				   SUSPEND_MODE_CTRL_BIT | AICL_EN_BIT,
++				   SUSPEND_MODE_CTRL_BY_I2C | AICL_EN_BIT);
++	if (ret)
++		return ret;
++
++	/* Static (non-pulsing) STAT pin interrupt. */
++	ret = smb1351_masked_write(chip, SMB1351_REG_VARIOUS_FUNC2,
++				   STAT_PIN_CONFIG_BIT, STAT_PIN_CONFIG_BIT);
++	if (ret)
++		return ret;
++
++	/* Adapter config. */
++	ret = smb1351_masked_write(chip, SMB1351_REG_OTG_POWER_OPTIONS,
++				   ADAPTER_CONFIG_MASK, ADAPTER_CONFIG_MASK);
++	if (ret)
++		return ret;
++
++	/* 5-9 V input range. */
++	ret = smb1351_masked_write(chip, SMB1351_REG_FLEXCHARGER,
++				   CHG_CONFIG_MASK, CHG_CONFIG);
++	if (ret)
++		return ret;
++
++	/* Auto recharge enabled. */
++	ret = smb1351_masked_write(chip, SMB1351_REG_CHG_CTRL,
++				   AUTO_RECHG_BIT | AUTO_RECHG_TH_BIT, 0);
++	if (ret)
++		return ret;
++
++	/* Enable/disable charging via I2C (not the EN pin). */
++	ret = smb1351_masked_write(chip, SMB1351_REG_CHG_PIN_EN,
++				   EN_PIN_CTRL_MASK | USBCS_CTRL_BIT |
++				   CHG_ERR_BIT | APSD_DONE_BIT |
++				   LED_BLINK_FUNC_BIT,
++				   EN_BY_I2C | USBCS_CTRL_BY_I2C |
++				   CHG_ERR_BIT | APSD_DONE_BIT |
++				   LED_BLINK_FUNC_BIT);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int smb1351_enable_charging(struct smb1351 *chip, bool en)
++{
++	int ret;
++
++	ret = smb1351_enable_volatile_writes(chip);
++	if (ret)
++		return ret;
++
++	return smb1351_masked_write(chip, SMB1351_REG_CMD_CHG,
++				    CMD_CHG_EN_BIT, en ? CMD_CHG_EN_BIT : 0);
++}
++
++static int smb1351_get_status(struct smb1351 *chip, int *online, int *status)
++{
++	unsigned int reg;
++	int ret;
++
++	ret = regmap_read(chip->regmap, SMB1351_REG_STATUS_1, &reg);
++	if (ret)
++		return ret;
++	*online = !!(reg & STATUS_INPUT_USB_BIT);
++
++	ret = regmap_read(chip->regmap, SMB1351_REG_STATUS_4, &reg);
++	if (ret)
++		return ret;
++
++	if (reg & STATUS_DONE_BIT)
++		*status = POWER_SUPPLY_STATUS_FULL;
++	else if ((reg & STATUS_CHG_MASK) == STATUS_NO_CHARGING)
++		*status = POWER_SUPPLY_STATUS_NOT_CHARGING;
++	else
++		*status = POWER_SUPPLY_STATUS_CHARGING;
++
++	return 0;
++}
++
++static int smb1351_psy_get_property(struct power_supply *psy,
++				    enum power_supply_property psp,
++				    union power_supply_propval *val)
++{
++	struct smb1351 *chip = power_supply_get_drvdata(psy);
++	int online, status, ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		ret = smb1351_get_status(chip, &online, &status);
++		if (ret)
++			return ret;
++		val->intval = online;
++		return 0;
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = smb1351_get_status(chip, &online, &status);
++		if (ret)
++			return ret;
++		val->intval = status;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static enum power_supply_property smb1351_psy_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_STATUS,
++};
++
++static const struct power_supply_desc smb1351_psy_desc = {
++	.name = "smb1351-charger",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = smb1351_psy_props,
++	.num_properties = ARRAY_SIZE(smb1351_psy_props),
++	.get_property = smb1351_psy_get_property,
++};
++
++static void smb1351_status_work(struct work_struct *work)
++{
++	struct smb1351 *chip = container_of(work, struct smb1351, status_work.work);
++
++	power_supply_changed(chip->psy);
++}
++
++static irqreturn_t smb1351_irq_handler(int irq, void *data)
++{
++	struct smb1351 *chip = data;
++
++	schedule_delayed_work(&chip->status_work, msecs_to_jiffies(20));
++
++	return IRQ_HANDLED;
++}
++
++static int smb1351_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct smb1351 *chip;
++	struct power_supply_config psy_cfg = {};
++	u32 ichg_ua = 1800000, cv_uv = 4396000, ieoc_ua = 200000;
++	int ret;
++
++	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->dev = dev;
++
++	chip->regmap = devm_regmap_init_i2c(client, &smb1351_regmap_config);
++	if (IS_ERR(chip->regmap))
++		return dev_err_probe(dev, PTR_ERR(chip->regmap),
++				     "failed to init regmap\n");
++
++	i2c_set_clientdata(client, chip);
++
++	of_property_read_u32(dev->of_node, "qcom,fast-charge-current-microamp", &ichg_ua);
++	of_property_read_u32(dev->of_node, "qcom,float-voltage-microvolt", &cv_uv);
++	of_property_read_u32(dev->of_node, "qcom,termination-current-microamp", &ieoc_ua);
++
++	ret = smb1351_init_hw(chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to init hardware\n");
++
++	ret = smb1351_set_float_voltage(chip, cv_uv);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set float voltage\n");
++
++	ret = smb1351_set_fastchg_current(chip, ichg_ua);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set fastchg current\n");
++
++	ret = smb1351_set_prechg_current(chip, min(ichg_ua / 10, 700000U));
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set prechg current\n");
++
++	ret = smb1351_enable_charging(chip, true);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable charging\n");
++
++	psy_cfg.drv_data = chip;
++	psy_cfg.of_node = dev->of_node;
++	chip->psy = devm_power_supply_register(dev, &smb1351_psy_desc, &psy_cfg);
++	if (IS_ERR(chip->psy))
++		return dev_err_probe(dev, PTR_ERR(chip->psy),
++				     "failed to register power supply\n");
++
++	INIT_DELAYED_WORK(&chip->status_work, smb1351_status_work);
++
++	chip->irq = client->irq;
++	if (chip->irq > 0) {
++		ret = devm_request_threaded_irq(dev, chip->irq, NULL,
++						smb1351_irq_handler,
++						IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++						"smb1351", chip);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to request irq\n");
++	}
++
++	dev_info(dev, "SMB1351 charger ready (ichg=%uuA cv=%uuV ieoc=%uuA)\n",
++		 ichg_ua, cv_uv, ieoc_ua);
++
++	return 0;
++}
++
++static const struct of_device_id smb1351_of_match[] = {
++	{ .compatible = "qcom,smb1351" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, smb1351_of_match);
++
++static const struct i2c_device_id smb1351_i2c_id[] = {
++	{ "smb1351", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, smb1351_i2c_id);
++
++static struct i2c_driver smb1351_driver = {
++	.driver = {
++		.name = "smb1351-charger",
++		.of_match_table = smb1351_of_match,
++	},
++	.probe = smb1351_probe,
++	.id_table = smb1351_i2c_id,
++};
++module_i2c_driver(smb1351_driver);
++
++MODULE_AUTHOR("postmarketOS");
++MODULE_DESCRIPTION("SMB1351 standalone battery charger driver");
++MODULE_LICENSE("GPL");
 diff --git a/include/linux/mfd/mt6358/core.h b/include/linux/mfd/mt6358/core.h
 index 68578e201..7d1992875 100644
 --- a/include/linux/mfd/mt6358/core.h

@@ -18,7 +18,8 @@ Helio G80 / **MT6769T**). ВАЖНО: аппарат — ревизия **Huaxin
 - ✅ eMMC (4 ГБ RAM, карвеауты LK в порядке)
 - ✅ Батарея (fuel gauge): % заряда по VBAT + OCV-таблица (adc-battery)
 
-**НЕ работает:** зарядка (SMB1351 — нет драйвера), Wi-Fi/BT (gen4m), аудио (mt6358).
+**НЕ работает:** зарядка (драйвер SMB1351 написан, НЕ собран/проверен — см. §8),
+Wi-Fi/BT (gen4m), аудио (mt6358).
 
 ---
 
@@ -215,9 +216,13 @@ mainline не просыпается → CPU-кластер зависает. GP
 
 1. **Проверить r21** (LEVEL_LOW + без cluster-sleep + батарея): стабильно 10+ мин,
    IRQ 172 = 0/с, `cat /sys/class/power_supply/fuel-gauge/capacity` → % заряда.
-2. **Зарядка (SMB1351)** — нужен порт драйвера SMB1351 (его нет в mainline), чтобы
-   реально заряжать. Fuel gauge (проценты) уже работает от VBAT. См. патчи
-   `hataketsu/mt6768-mainline-notes` → `kernel-patches/battery/*.patch` (применены).
+2. **Зарядка (SMB1351)** — написан минимальный драйвер `drivers/power/supply/smb1351-charger.c`
+   (в патче), узел `&i2c7 { smb1351: charger@55 }` в DTS, `CONFIG_CHARGER_SMB1351=y`.
+   **НЕ СОБРАН/НЕ ПРОВЕРЕН**: сборка заблокирована (в окружении сломан `sudo` →
+   `no_new_privs`, pmbootstrap не может собрать). Дальше:
+   `pmbootstrap build linux-postmarketos-mediatek-mt6768`, прошить, и проверить
+   `cat /sys/class/power_supply/smb1351-charger/*` + статус батареи при подключении
+   зарядки. См. §6b-спутник ниже и `lancelot/0001-ft8719-touch.patch`.
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже
    извлечены в `lancelot/extracted/firmware/` (WIFI_RAM_CODE_soc1_0_1a_1.bin и др.).
 4. **Аудио** — mt6358 DAI-обвязка.

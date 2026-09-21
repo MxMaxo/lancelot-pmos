@@ -11,3 +11,5 @@ CONFIG_TOUCHSCREEN_FOCALTECH_FT8719=y
 CONFIG_INPUT_EVDEV=y
 # Иначе модули падают "failed to validate module BTF: -22"
 CONFIG_MODULE_ALLOW_BTF_MISMATCH=y
+# Зарядка: SMB1351 (standalone charger на I2C7 @ 0x55)
+CONFIG_CHARGER_SMB1351=y
