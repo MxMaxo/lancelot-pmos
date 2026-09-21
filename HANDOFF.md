@@ -251,13 +251,13 @@ mainline не просыпается → CPU-кластер зависает. GP
    IRQ 172 = 0/с, `cat /sys/class/power_supply/fuel-gauge/capacity` → % заряда.
 2. **Зарядка (SMB1351)** — драйвер `drivers/power/supply/smb1351-charger.c` (в патче),
    узел `&i2c7 { smb1351: charger@55 }` в DTS, `CONFIG_CHARGER_SMB1351=y`.
-   **СОБРАН (без sudo, см. §5b), компилируется чисто (0 warning), драйвер в vmlinux.**
-   НЕ ПРОВЕРЕН НА ЖЕЛЕЗЕ. Готовый boot.img: `flash/boot_touch_r22.img` (ядро + dtb с
-   нодой smb1351, старый ramdisk/cmdline, AVB). Прошить (см. §5) и проверить:
-   `ls /sys/class/power_supply/` (должен появиться `smb1351-charger`),
-   `cat /sys/class/power_supply/smb1351-charger/{online,status}`,
-   подключить зарядку → батарея должна показывать `Charging`.
-   См. `lancelot/0001-ft8719-touch.patch`.
+   **ПРОВЕРЕНО НА ЖЕЛЕЗЕ (r23):** чип найден на I2C7 @ 0x55 (`7-0055`),
+   `smb1351-charger` в power_supply (type=USB, `online=1` = VBUS детектится).
+   Батарея (`fuel-gauge`) показывает `status=Charging` при подключении зарядки
+   (нужен `supplied_to = "fuel-gauge"` в драйвере — иначе `power_supply_am_i_supplied()`
+   возвращает -ENODEV и батарея вечно `Discharging`).
+   **«Not charging» при 100% — норма**: батарея полна (4.4В > float 4.38В), реальный
+   зарядный цикл начнётся при разряде. См. `lancelot/0001-ft8719-touch.patch`.
 3. **Wi-Fi/BT** — порт gen4m (`hataketsu/redmi9-lancelot-mainline`); прошивки уже
    извлечены в `lancelot/extracted/firmware/` (WIFI_RAM_CODE_soc1_0_1a_1.bin и др.).
 4. **Аудио** — mt6358 DAI-обвязка.

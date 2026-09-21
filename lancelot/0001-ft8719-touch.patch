@@ -1659,10 +1659,10 @@ index f5f2566b3..978adc2f9 100644
  		return dev_err_probe(&pdev->dev, ret, "Failed to register delayed work\n");
 diff --git a/drivers/power/supply/smb1351-charger.c b/drivers/power/supply/smb1351-charger.c
 new file mode 100644
-index 000000000..4c2ce6c55
+index 000000000..f8a731818
 --- /dev/null
 +++ b/drivers/power/supply/smb1351-charger.c
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,458 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * SMB1351 standalone switching battery charger driver
@@ -2003,6 +2003,11 @@ index 000000000..4c2ce6c55
 +	.get_property = smb1351_psy_get_property,
 +};
 +
++/* The generic-adc-battery power supply this charger feeds. */
++static char *smb1351_supplied_to[] = {
++	"fuel-gauge",
++};
++
 +static void smb1351_status_work(struct work_struct *work)
 +{
 +	struct smb1351 *chip = container_of(work, struct smb1351, status_work.work);
@@ -2066,6 +2071,8 @@ index 000000000..4c2ce6c55
 +
 +	psy_cfg.drv_data = chip;
 +	psy_cfg.of_node = dev->of_node;
++	psy_cfg.supplied_to = smb1351_supplied_to;
++	psy_cfg.num_supplicants = ARRAY_SIZE(smb1351_supplied_to);
 +	chip->psy = devm_power_supply_register(dev, &smb1351_psy_desc, &psy_cfg);
 +	if (IS_ERR(chip->psy))
 +		return dev_err_probe(dev, PTR_ERR(chip->psy),
